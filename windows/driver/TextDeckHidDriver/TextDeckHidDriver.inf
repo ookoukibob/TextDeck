@@ -1,0 +1,101 @@
+; ---------------------------------------------------------------------------
+; TextDeckHidDriver.inf
+;
+; Root-enumerated KMDF/VHF virtual HID keyboard for TextDeck.
+; Written for TextDeck against the WDK INF documentation.
+;
+; Security: the device object is reachable by SYSTEM and Administrators only.
+; SDDL D:P(A;;GA;;;SY)(A;;GA;;;BA) grants GENERIC_ALL to those two SIDs and
+; nothing to anyone else. This is deliberately NOT widened for interactive
+; users: the virtual keyboard injects input into the whole session, so letting
+; an arbitrary process drive it would be a privilege-escalation path.
+; ---------------------------------------------------------------------------
+
+[Version]
+Signature   = "$WINDOWS NT$"
+Class       = HIDClass
+ClassGuid   = {745a17a0-74d3-11d0-b6fe-00a0c90f57da}
+Provider    = %ManufacturerName%
+CatalogFile = TextDeckHidDriver.cat
+DriverVer   = 01/01/2026,00.00.00.000
+PnpLockdown = 1
+
+[DestinationDirs]
+DefaultDestDir = 12
+
+; Source media 1 is "the directory containing this INF". The fourth field is
+; the (unused) disk label; leaving it empty is what Inf2Cat expects for an
+; unpacked driver package.
+[SourceDisksNames]
+1 = %DiskName%
+
+[SourceDisksFiles]
+TextDeckHidDriver.sys = 1
+
+; ---------------------------------------------------------------------------
+; Models: ONE hardware ID, so the installer can never match a foreign device.
+; ---------------------------------------------------------------------------
+[Manufacturer]
+%ManufacturerName% = TextDeck, NT$ARCH$
+
+[TextDeck.NT$ARCH$]
+%TextDeck.DeviceDesc% = TextDeck_Device, Root\TextDeckHidDriver
+
+; ---------------------------------------------------------------------------
+; Install
+; ---------------------------------------------------------------------------
+[TextDeck_Device.NT]
+CopyFiles = TextDeck_Drivers_Dir
+
+[TextDeck_Drivers_Dir]
+TextDeckHidDriver.sys
+
+[TextDeck_Device.NT.HW]
+AddReg = TextDeck_Device.NT.AddReg
+
+[TextDeck_Device.NT.AddReg]
+; VHF (Virtual HID Framework) must be loaded as a LOWER FILTER below this
+; driver: "This driver must be loaded as a lower filter driver below your driver
+; in the HID source device stack."
+;   https://learn.microsoft.com/windows-hardware/drivers/hid/virtual-hid-framework--vhf-
+;
+; The entry belongs in the DDInstall .HW section (it is a device-specific
+; filter, written to the device's hardware key), which is why this section is
+; referenced from [TextDeck_Device.NT.HW] above and not from the plain
+; DDInstall section.
+;
+; 0x00010000 is FLG_ADDREG_TYPE_MULTI_SZ: LowerFilters is REG_MULTI_SZ. The
+; documented spelling for this keyword is exactly
+;   HKR,,LowerFilters,0x10000,service-name
+; (INF AddReg directive, "Special value-entry-name keywords"). Do not "correct"
+; it to 0x00010008 -- that ORs in FLG_ADDREG_APPEND, which changes the meaning
+; from "write this list" to "append to an existing list".
+HKR,,LowerFilters,0x00010000,"vhf"
+; Restrict the device object to SYSTEM + Administrators (see the header note).
+HKR,,Security,,"D:P(A;;GA;;;SY)(A;;GA;;;BA)"
+
+[TextDeck_Device.NT.Services]
+AddService = TextDeckHidDriver, %SPSVCINST_ASSOCSERVICE%, TextDeck_Service_Inst
+
+[TextDeck_Service_Inst]
+DisplayName    = %TextDeck.SVCDESC%
+ServiceType    = 1              ; SERVICE_KERNEL_DRIVER
+StartType      = 3              ; SERVICE_DEMAND_START
+ErrorControl   = 1              ; SERVICE_ERROR_NORMAL
+ServiceBinary  = %12%\TextDeckHidDriver.sys
+
+; ---------------------------------------------------------------------------
+; KMDF
+; ---------------------------------------------------------------------------
+[TextDeck_Device.NT.Wdf]
+KmdfService = TextDeckHidDriver, TextDeck_wdfsect
+
+[TextDeck_wdfsect]
+KmdfLibraryVersion = $KMDFVERSION$
+
+[Strings]
+SPSVCINST_ASSOCSERVICE = 0x00000002
+ManufacturerName       = "TextDeck Project"
+DiskName               = "TextDeck Virtual HID Driver"
+TextDeck.DeviceDesc    = "TextDeck Virtual HID Keyboard"
+TextDeck.SVCDESC       = "TextDeck Virtual HID Keyboard Driver"

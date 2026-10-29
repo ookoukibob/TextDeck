@@ -1,0 +1,3 @@
+# 桌面程序依赖
+# Python 3.14.7 (本机已装), tkinter 9.0 属于 Python 标准库
+pyserial==3.5

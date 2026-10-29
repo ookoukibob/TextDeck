@@ -1,0 +1,5 @@
+# ---- host-test build artifacts (regenerate with build_state_test.ps1) ----
+*.obj
+*.exe
+*.pdb
+*.ilk
