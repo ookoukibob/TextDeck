@@ -5,13 +5,13 @@
 #
 # Unlike e2e_software_mode.ps1 (SendInput, no driver), this proves the KERNEL
 # path: the KMDF/VHF driver is loaded, Windows enumerated a HID keyboard, the
-# app opens \\.\VirtualHIDDevice and submits IOCTL_KEYBOARD_INPUT_EX, and
+# app opens \\.\TextDeckHidDevice and submits IOCTL_TEXTDECK_SUBMIT_KEY, and
 # characters actually land in a dedicated target window.
 #
 # Preconditions (checked, never assumed):
-#   - service VirtualHIDDriver exists and is RUNNING
-#   - device ROOT\VIRTUALHIDDRIVER\0000 exists, Status OK, Problem CM_PROB_NONE
-#   - a HID keyboard under HID\HID_DEVICE_SYSTEM_VHF is enumerated
+#   - service TextDeckHidDriver exists and is RUNNING
+#   - device ROOT\TextDeckHidDriver\0000 exists, Status OK, Problem CM_PROB_NONE
+#   - a HID keyboard matching VID_1209&PID_0001 is enumerated and OK
 #   - this script runs ELEVATED: the INF grants the device to SY+BA only, so an
 #     unelevated app gets ERROR_ACCESS_DENIED by design - that is NOT a bug.
 #
@@ -275,16 +275,18 @@ try {
     Assert-True $isAdmin 'P1-elevated' "elevated=$isAdmin (INF grants device to SY+BA only)"
     if (-not $isAdmin) { throw 'must run elevated to reach the device interface' }
 
-    $svc = Get-CimInstance Win32_SystemDriver -Filter "Name='VirtualHIDDriver'" -ErrorAction SilentlyContinue
+    $svc = Get-CimInstance Win32_SystemDriver -Filter "Name='TextDeckHidDriver'" -ErrorAction SilentlyContinue
     Assert-True ($null -ne $svc -and $svc.State -eq 'Running') 'P2-service-running' "state=$($svc.State) started=$($svc.Started) path=$($svc.PathName)"
 
-    $dev = Get-PnpDevice -InstanceId 'ROOT\VIRTUALHIDDRIVER\0000' -ErrorAction SilentlyContinue
+    $dev = Get-PnpDevice -InstanceId 'ROOT\TextDeckHidDriver\0000' -ErrorAction SilentlyContinue
     Assert-True ($null -ne $dev -and $dev.Status -eq 'OK' -and $dev.Problem -eq 'CM_PROB_NONE') 'P2-device-ok' "instance=$($dev.InstanceId) status=$($dev.Status) problem=$($dev.Problem)"
 
-    $vhfKb = @(Get-PnpDevice -Class Keyboard -ErrorAction SilentlyContinue | Where-Object { $_.InstanceId -like 'HID\HID_DEVICE_SYSTEM_VHF*' })
+    $vhfKb = @(Get-PnpDevice -Class Keyboard -ErrorAction SilentlyContinue |
+               Where-Object { $_.InstanceId -match 'VID_1209&PID_0001' -and $_.Status -eq 'OK' })
     Assert-True ($vhfKb.Count -gt 0) 'P2-vhf-keyboard-enumerated' "count=$($vhfKb.Count) ids=$(($vhfKb | ForEach-Object { $_.InstanceId }) -join ';')"
 
-    $vhfDev = @(Get-PnpDevice -ErrorAction SilentlyContinue | Where-Object { $_.InstanceId -like 'VHF\HID_DEVICE_SYSTEM_VHF*' })
+    $vhfDev = @(Get-PnpDevice -ErrorAction SilentlyContinue |
+                Where-Object { $_.InstanceId -match 'VID_1209&PID_0001' -and $_.Status -eq 'OK' })
     Assert-True ($vhfDev.Count -gt 0) 'P2-vhf-child-enumerated' "count=$($vhfDev.Count)"
 
     if (-not (Test-Path $Exe)) { throw "exe not found: $Exe" }
@@ -331,7 +333,7 @@ try {
     $null = Set-ModeRadio $typer $IDC_RADIO_HID
     $title = Get-Title $typer
     Log "title after clicking the HID radio: $title"
-    Assert-True ($title -match '\[Virtual HID 模式\]') 'P3-hid-mode-selected' "title=$title"
+    Assert-True ($title -match '\[TextDeck HID 模式\]') 'P3-hid-mode-selected' "title=$title"
     Assert-True (-not ($title -match 'SendInput')) 'P3-not-software-mode' 'title carries no SendInput marker'
 
     Log '--- T1: real HID text (EN letters, digits, punctuation, Enter) ---'
@@ -347,7 +349,7 @@ try {
         Send-Cmd $typer $IDC_BTN_START
         $st = Wait-Status $typer '(完成【|已停止【|焦点离开|错误|失败|无法打开)' 120
         Log "  status: $st"
-        Assert-True ($st -match '完成【Virtual HID 模式】') 'T1-completed-status' "status=$st"
+        Assert-True ($st -match '完成【TextDeck HID 模式】') 'T1-completed-status' "status=$st"
         $actual1 = Wait-SnapSettled $snap1 10
         Assert-True (Test-Equal $t1 $actual1) 'T1-text-identical' "expected=$(($t1 -replace $CRLF,'<NL>')) | actual=$(($actual1 -replace $CRLF,'<NL>'))"
         if ($st -match '实际输入\s*(\d+)\s*字符') {
@@ -395,7 +397,7 @@ try {
         [HNative]::keybd_event(0x11, 0, 2, [UIntPtr]::Zero)
         $st3 = Wait-Status $typer '(已停止【|完成【|错误)' 20
         Log "  status: $st3"
-        Assert-True ($st3 -match '已停止【Virtual HID 模式】') 'T3-stopped-status' "status=$st3"
+        Assert-True ($st3 -match '已停止【TextDeck HID 模式】') 'T3-stopped-status' "status=$st3"
         $a3 = Wait-SnapSettled $snap3 8
         Assert-True ($a3.Length -gt 0) 'T3-some-output-arrived' "typed $($a3.Length) chars through the kernel before stop"
         Assert-True ($a3.Length -lt $longText.Length) 'T3-partial-output' "typed $($a3.Length) of $($longText.Length) chars"
@@ -420,7 +422,7 @@ try {
         Send-Cmd $typer $IDC_BTN_STOP
         $st4 = Wait-Status $typer '(已停止【|完成【|错误)' 20
         Log "  status: $st4"
-        Assert-True ($st4 -match '已停止【Virtual HID 模式】') 'T4-stopped-status' "status=$st4"
+        Assert-True ($st4 -match '已停止【TextDeck HID 模式】') 'T4-stopped-status' "status=$st4"
         $a4 = Wait-SnapSettled $snap4 8
         Assert-True ($a4.Length -gt 0) 'T4-some-output-arrived' "typed $($a4.Length) chars through the kernel before stop"
         Assert-True ($a4.Length -lt $longText.Length) 'T4-partial-output' "typed $($a4.Length) of $($longText.Length)"
@@ -441,7 +443,7 @@ try {
         Send-Cmd $typer $IDC_BTN_START
         $st5 = Wait-Status $typer '(完成【|已停止【|错误)' 40
         Log "  status: $st5"
-        Assert-True ($st5 -match '完成【Virtual HID 模式】') 'T5-completed' "status=$st5"
+        Assert-True ($st5 -match '完成【TextDeck HID 模式】') 'T5-completed' "status=$st5"
         $a5 = Wait-SnapSettled $snap5 8
         Assert-True (Test-Equal $t5 $a5) 'T5-no-modifier-residue' "got '$a5' (a stuck Shift would give 'CLEAN')"
     } finally { if ($t5w) { Stop-Target $t5w } }
