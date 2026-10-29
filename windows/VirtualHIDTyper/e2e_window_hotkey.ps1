@@ -1,7 +1,7 @@
 ﻿# ---------------------------------------------------------------------------
-# e2e_r13_window.ps1
+# e2e_window_hotkey.ps1
 #
-# REAL acceptance for Round 13 on the OFFICIAL EXE from the delivery folder:
+# REAL acceptance for the window and hotkey features on the built EXE:
 #   Goal 1 - hotkeys: new defaults (Ctrl+Alt+Shift+F9/F10), dialog rebind,
 #             conflict detection with LOSSLESS rollback (1409), persistence,
 #             restore-defaults, save-failure notice, startup-conflict notice.
@@ -14,7 +14,7 @@
 # ---------------------------------------------------------------------------
 param(
     [string]$Exe = (Join-Path (Split-Path $PSScriptRoot -Parent) "dist\VirtualHIDTyper\VirtualHIDTyper.exe"),
-    [string]$LogPath = (Join-Path (Split-Path $PSScriptRoot -Parent) "logs\e2e-r13-window.log")
+    [string]$LogPath = (Join-Path (Split-Path $PSScriptRoot -Parent) "logs\e2e-window-hotkey.log")
 )
 
 $ErrorActionPreference = "Stop"
@@ -176,7 +176,7 @@ $IDC_HK_CANCEL = 3005; $IDC_HK_DEFAULT = 3006
 
 # Measure in TRUE device pixels: a DPI-unaware harness gets every rect
 # virtualised (this machine runs 150% -> all reads come back at 2/3 of the
-# real size), which made Round 13 geometry asserts meaningless.
+# real size), which made the geometry asserts meaningless.
 $script:DpiAware = $false
 try { $script:DpiAware = [TN]::SetProcessDpiAwarenessContext([IntPtr](-4)) } catch { }
 if (-not $script:DpiAware) { try { $script:DpiAware = [TN]::SetProcessDPIAware() } catch { } }
@@ -200,8 +200,7 @@ function Get-WmTextTO([IntPtr]$h, [int]$cap = 4096) {
 }
 function Watch-AfterOk([IntPtr]$typer, [IntPtr]$dlg, [uint32]$tpid, [int]$sec) {
     # 200ms timeline of the post-OK window: dialog alive? any #32770 up
-    # (box!)? hotkey line? title? INI written? H4 was a black box (box never
-    # seen, dialog already gone, nothing committed) - every state CHANGE is
+    # (box!)? hotkey line? title? INI written? every state CHANGE is
     # logged with its timestamp so app-side and harness-side diverge visibly.
     $t0 = Get-Date
     $f0 = Get-Item -LiteralPath $iniPath -ErrorAction SilentlyContinue
@@ -232,7 +231,7 @@ function Watch-AfterOk([IntPtr]$typer, [IntPtr]$dlg, [uint32]$tpid, [int]$sec) {
     $null = Log "  [watch] end at $([int]((Get-Date) - $t0).TotalMilliseconds)ms"
 }
 function Press-Chord([int]$vk) {
-    # Ctrl+Alt+Shift+<vk> - the Round 13 default modifier set
+    # Ctrl+Alt+Shift+<vk> - the default modifier set
     [TN]::keybd_event(0x11,0,0,[UIntPtr]::Zero); [TN]::keybd_event(0x12,0,0,[UIntPtr]::Zero); [TN]::keybd_event(0x10,0,0,[UIntPtr]::Zero)
     [TN]::keybd_event([byte]$vk,0,0,[UIntPtr]::Zero)
     Start-Sleep -Milliseconds 60
@@ -308,13 +307,13 @@ function Force-Fg([IntPtr]$h) {
 
 function Open-HotkeyDialog([IntPtr]$typer) {
     # Enumerate by PID + class instead of FindWindow(class, title): the
-    # title-based lookup intermittently misses a dialog that IS open (seen
-    # in mini_capture and run5's H4 - the returned Zero silently no-ops
-    # every downstream step). Enumeration by PID cannot flake.
+    # title-based lookup intermittently misses a dialog that IS open -
+    # the returned Zero silently no-ops every downstream step.
+    # Enumeration by PID cannot flake.
     $tpid = [uint32]0
     [void][TN]::GetWindowThreadProcessId($typer, [ref]$tpid)
-    # The 1011 POST is asynchronous: if it is transiently lost (observed
-    # once in run6 - no dialog appeared for the full 8s poll), re-post.
+    # The 1011 POST is asynchronous: if it is transiently lost (no dialog
+    # appears for the full 8s poll), re-post.
     # A late-first-post + retry cannot stack dialogs: the second 1011 is
     # swallowed by the app's own never-stack guard and the poll then
     # finds the first dialog.
@@ -346,8 +345,8 @@ function Close-HotkeyDialog([IntPtr]$dlg, [int]$cmdId) {
         if ($sb.ToString() -eq "#32770") {
             # still open AND still a dialog: ask it to close through the
             # pump path. ([uint32], NOT [IntPtr]: TN.PostMessage's msg
-            # parameter is uint - an IntPtr here threw a terminating
-            # conversion error and killed the whole harness in run5.)
+            # parameter is uint - an IntPtr here throws a terminating
+            # conversion error and kills the whole harness.)
             [void][TN]::PostMessage($dlg, [uint32]0x0010, [IntPtr]::Zero, [IntPtr]::Zero)  # WM_CLOSE
             $dl = (Get-Date).AddSeconds(4)
             while ((Get-Date) -lt $dl -and [TN]::IsWindow($dlg)) { Start-Sleep -Milliseconds 120 }
@@ -395,8 +394,8 @@ function Dialog-Capture([IntPtr]$dlg, [int]$fieldId, [int]$vk) {
     $null = Log "    probe[poll-end] dlg alive=$([TN]::IsWindow($dlg))"
     # NOTE: every Log here must be `$null = Log` - the caller assigns our
     # return value, and Write-Output from Log would otherwise join the
-    # output stream, turning the returned text into an Object[] (that broke
-    # run8d's H3: Assert-True's [bool] param choked on a 2-element array).
+    # output stream, turning the returned text into an Object[] (which
+    # breaks Assert-True's [bool] param with a 2-element array).
     if ($after -cne $before) {
         $null = Log "    capture vk=0x$($vk.ToString('X2')) field=$fieldId ok: '$before' -> '$after'"
     } else {
@@ -407,12 +406,12 @@ function Dialog-Capture([IntPtr]$dlg, [int]$fieldId, [int]$vk) {
 # Dismisses a message box by title (returns $true if one was found+clicked).
 function Dismiss-Box([string]$title) {
     # Find the app's box by PID ENUMERATION + exact title: FindWindow(class,
-    # title) intermittently misses boxes that are provably up (run6 H9: the
-    # save-failure box stayed open and blocked the whole app thread while
-    # FindWindow swore nothing was there). Enumeration cannot flake.
-    # POLL up to 3s: run7 called this at +800ms and swore the box was absent
-    # while repro9 saw the same box only at +1500ms - a single-shot lookup
-    # turns "late" into "never". Staged logs distinguish not-yet vs never.
+    # title) intermittently misses boxes that are provably up (the box can
+    # stay open and block the whole app thread while FindWindow reports
+    # nothing there). Enumeration cannot flake.
+    # POLL up to 3s: a box observed only at +1500ms looks absent to a
+    # single-shot lookup at +800ms - that turns "late" into "never".
+    # Staged logs distinguish not-yet vs never.
     $tpid = [uint32]$script:typerProc.Id
     $sw = [Diagnostics.Stopwatch]::StartNew()
     $b = [TN]::ByPidClassTitle($tpid, "#32770", $title)
@@ -428,9 +427,9 @@ function Dismiss-Box([string]$title) {
         return $false
     }
     $null = Log ("  Dismiss-Box: '" + $title + "' appeared hwnd=0x" + $b.ToString('X') + " at t=" + $sw.ElapsedMilliseconds + "ms")
-    # Staged dismissal - run9's H9 found the box instantly but a single
-    # BM_CLICK did not close it, so every stage is tried and LOGGED, and the
-    # stage that succeeded is visible in the log:
+    # Staged dismissal - the box can appear instantly yet a single
+    # BM_CLICK does not close it, so every stage is tried and LOGGED, and
+    # the stage that succeeded is visible in the log:
     #   1) BM_CLICK on the first Button child (synchronous)
     #   2) posted IDOK to the box (the modal loop dispatches it -> EndDialog)
     #   3) posted WM_CLOSE to the box
@@ -456,7 +455,7 @@ function Dismiss-Box([string]$title) {
     }
     # VERIFY the box is really gone: a box that survives all stages must
     # read as a failure - a still-open modal box blocks the app thread and
-    # would silently misjudge every later step (run5's H9 tail).
+    # would silently misjudge every later step.
     if ([TN]::IsWindow($b)) {
         $null = Log ("  [WARN] Dismiss-Box: box found but NO stage closed it (hwnd=0x" + $b.ToString('X') + ")")
         $null = Log ("      " + ([TN]::ListPidsWindows($tpid) -replace "`n", " || ").Trim())
@@ -500,7 +499,7 @@ function Start-Holder([int]$mods, [int]$vk) {
     $ready = Join-Path $env:TEMP ("vht_holder_ready_" + [guid]::NewGuid().ToString('N') + ".txt")
     $null = Log "  Start-Holder: launching holder mods=$mods vk=0x$($vk.ToString('X2'))"   # $null= : caller assigns our return value
     $hp = Start-Process powershell -ArgumentList @("-NoProfile","-ExecutionPolicy","Bypass","-File",
-        (Join-Path $PSScriptRoot "e2e_r13_hk_holder.ps1"),
+        (Join-Path $PSScriptRoot "e2e_hotkey_conflict.ps1"),
         "-Mods", $mods, "-Vk", $vk, "-HoldSecs", "600",
         "-ReadyFile", "`"" + $ready + "`"") -PassThru -WindowStyle Hidden
     $dl = (Get-Date).AddSeconds(40)
@@ -523,7 +522,7 @@ function Start-Holder([int]$mods, [int]$vk) {
 
 $logDir = Split-Path $LogPath -Parent
 if (-not (Test-Path $logDir)) { New-Item -ItemType Directory -Force -Path $logDir | Out-Null }
-$ev = Join-Path $logDir "e2e-r13-evidence"
+$ev = Join-Path $logDir "e2e-window-hotkey-evidence"
 if (-not (Test-Path $ev)) { New-Item -ItemType Directory -Force -Path $ev | Out-Null }
 
 # --- user settings protection ------------------------------------------------
@@ -579,7 +578,7 @@ function Exit-TyperViaTray {
 }
 
 try {
-    Log "=== Round 13 window + hotkey E2E  $(Get-Date -Format 'yyyy-MM-dd HH:mm:ss') ==="
+    Log "=== window + hotkey E2E  $(Get-Date -Format 'yyyy-MM-dd HH:mm:ss') ==="
     Log "EXE: $Exe"
     Assert-True (Test-Path $Exe) "EXE-present" $Exe
     $isAdmin = ([Security.Principal.WindowsPrincipal][Security.Principal.WindowsIdentity]::GetCurrent()).IsInRole([Security.Principal.WindowsBuiltInRole]::Administrator)
@@ -714,13 +713,13 @@ try {
 
     # --- W9: text persistence ------------------------------------------------
     Log "--- W9: text persistence ---"
-    Set-WmText ([TN]::GetDlgItem($typer, $IDC_EDIT_TEXT)) "R13 persist abc123 end"
+    Set-WmText ([TN]::GetDlgItem($typer, $IDC_EDIT_TEXT)) "persist abc123 end"
     Send-Cmd $typer $IDC_BTN_SAVE
     Start-Sleep -Milliseconds 400
     Exit-TyperViaTray
     Launch-Typer
     $txt = Get-WmText ([TN]::GetDlgItem($typer, $IDC_EDIT_TEXT)) 512
-    Assert-True ($txt -eq "R13 persist abc123 end") "W9-text-restored" "got '$txt'"
+    Assert-True ($txt -eq "persist abc123 end") "W9-text-restored" "got '$txt'"
 
     # --- W8: corrupt window section falls back to default size ---------------
     Log "--- W8: corrupt config fallback ---"
@@ -747,10 +746,10 @@ try {
     Log "  hotkeys: $hk3"
     Assert-True ($hk3 -match '开始: Ctrl\+Alt\+Shift\+F11 \(已注册\)' -and $hk3 -match '停止: Ctrl\+Alt\+Shift\+F10 \(已注册\)') "H3-status-updated" $hk3
     # the NEW chord really types via the real HID path
-    $t1 = "R13 F11 hotkey 0k"
+    $t1 = "F11 hotkey 0k"
     $w1 = $null
     try {
-        $w1 = Start-Target "R13 Target H3" (Join-Path $ev "h3.txt")
+        $w1 = Start-Target "Target H3" (Join-Path $ev "h3.txt")
         Assert-True (Force-Fg $w1.Hwnd) "H3-target-focused" "hwnd=0x$($w1.Hwnd.ToString('X'))"
         Set-WmText ([TN]::GetDlgItem($typer, $IDC_EDIT_TEXT)) $t1
         Set-WmText ([TN]::GetDlgItem($typer, $IDC_EDIT_INTERVAL)) "25"
@@ -788,9 +787,9 @@ try {
     # the OLD start chord must still work after the failed change
     $w2 = $null
     try {
-        $w2 = Start-Target "R13 Target H4" (Join-Path $ev "h4.txt")
+        $w2 = Start-Target "Target H4" (Join-Path $ev "h4.txt")
         Assert-True (Force-Fg $w2.Hwnd) "H4-target-focused" "hwnd=0x$($w2.Hwnd.ToString('X'))"
-        Set-WmText ([TN]::GetDlgItem($typer, $IDC_EDIT_TEXT)) "R14 rollback ok"
+        Set-WmText ([TN]::GetDlgItem($typer, $IDC_EDIT_TEXT)) "rollback ok"
         Set-WmText ([TN]::GetDlgItem($typer, $IDC_EDIT_INTERVAL)) "25"
         Start-Sleep -Milliseconds 300
         Press-Chord 0x7A    # old (still valid) F11 start
@@ -820,9 +819,9 @@ try {
     # the default start chord works again
     $w3 = $null
     try {
-        $w3 = Start-Target "R13 Target H6" (Join-Path $ev "h6.txt")
+        $w3 = Start-Target "Target H6" (Join-Path $ev "h6.txt")
         Assert-True (Force-Fg $w3.Hwnd) "H6-target-focused" "hwnd=0x$($w3.Hwnd.ToString('X'))"
-        Set-WmText ([TN]::GetDlgItem($typer, $IDC_EDIT_TEXT)) "R16 default back"
+        Set-WmText ([TN]::GetDlgItem($typer, $IDC_EDIT_TEXT)) "default back"
         Set-WmText ([TN]::GetDlgItem($typer, $IDC_EDIT_INTERVAL)) "25"
         Start-Sleep -Milliseconds 300
         Press-Chord 0x78    # Ctrl+Alt+Shift+F9
@@ -862,9 +861,9 @@ try {
     # tray manual start must still work (no hotkey needed)
     $w4 = $null
     try {
-        $w4 = Start-Target "R13 Target H7" (Join-Path $ev "h7.txt")
+        $w4 = Start-Target "Target H7" (Join-Path $ev "h7.txt")
         Assert-True (Force-Fg $w4.Hwnd) "H7-target-focused" "hwnd=0x$($w4.Hwnd.ToString('X'))"
-        Set-WmText ([TN]::GetDlgItem($typer, $IDC_EDIT_TEXT)) "R17 tray manual"
+        Set-WmText ([TN]::GetDlgItem($typer, $IDC_EDIT_TEXT)) "tray manual"
         Set-WmText ([TN]::GetDlgItem($typer, $IDC_EDIT_INTERVAL)) "25"
         Start-Sleep -Milliseconds 300
         Send-Cmd $typer $IDM_TRAY_START
@@ -915,6 +914,6 @@ finally {
 }
 
 Log ""
-if ($script:Failures -eq 0) { Log "RESULT: ALL ROUND 13 WINDOW/HOTKEY CHECKS PASSED" } else { Log "RESULT: $($script:Failures) FAILURE(S)" }
+if ($script:Failures -eq 0) { Log "RESULT: ALL WINDOW/HOTKEY CHECKS PASSED" } else { Log "RESULT: $($script:Failures) FAILURE(S)" }
 [IO.File]::WriteAllLines($LogPath, [string[]]$script:LogLines, (New-Object System.Text.UTF8Encoding($true)))
 if ($script:Failures -eq 0) { exit 0 } else { exit 1 }

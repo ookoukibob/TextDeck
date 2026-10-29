@@ -9,7 +9,7 @@
 # devices still use (pnputil refuses and we report it), and never touches
 # certificates, BCD, TESTSIGNING, HVCI or Secure Boot.
 #
-# FAILURE DISCIPLINE (Round 11): every pnputil call's REAL exit code is checked.
+# FAILURE DISCIPLINE: every pnputil call's REAL exit code is checked.
 # An earlier revision piped pnputil straight into Write-Host and exited 0 even
 # when the device could not be removed, so "uninstall succeeded" was reported
 # while the device was still present. Removal failures are now fatal.

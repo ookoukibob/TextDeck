@@ -25,12 +25,12 @@
 #       -ClipboardTest switch, and only when the original clipboard can be
 #       proven to round-trip (empty or readable text-only); otherwise it is
 #       refused before any write. Writes use a validated hidden window owned
-#       by THIS process as the clipboard owner (Round 10b: never
+#       by THIS process as the clipboard owner (note: never
 #       OpenClipboard(NULL) for Empty/Set). Recovery after any mid-sequence
 #       failure runs in the outer finally and is VERIFIED by re-reading --
 #       "attempted" and "verified" are always reported separately, never faked.
 #
-# Round 10b/10c: -ClipboardSeamSelfTest runs the same read/gate/transaction
+# -ClipboardSeamSelfTest runs the same read/gate/transaction
 # logic against an in-memory clipboard backend with one-shot fault injection
 # at each destructive step (owner validation, open, empty, set, close, enum,
 # restore) -- including queued multi-step failure combinations. The REAL
@@ -56,7 +56,7 @@ param(
     # verified backup/restore). Refused before any write if the original
     # clipboard cannot be round-tripped. Default run never writes clipboard.
     [switch]$ClipboardTest,
-    # Round 10b/10c: run ONLY the clipboard fault-injection suite against the
+    # Run ONLY the clipboard fault-injection suite against the
     # in-memory backend (no real clipboard write or clear; the real clipboard
     # is only READ for before/after fingerprints) and exit. No GUI processes
     # are started in this mode.
@@ -239,7 +239,7 @@ public class Native {
         return box[0];
     }
 
-    // ---- clipboard: exact Win32 backend (Round 10b) ------------------------
+    // ---- clipboard: exact Win32 backend ------------------------
     // Reads open the clipboard with the task association (NULL) and NEVER call
     // EmptyClipboard/SetClipboardData; the MSDN NULL-owner warning only applies
     // to the destructive path. Writes must use a validated hidden window owned
@@ -742,7 +742,7 @@ function Test-SentinelSafeToOverwrite([string[]]$formats, $text) {
 }
 
 # ----- clipboard transaction region (the ONLY destructive clipboard path) ---
-# Round 10b: every Empty/Set goes through an owner-window transaction. The
+# Every Empty/Set goes through an owner-window transaction. The
 # state flags record EXACTLY how far a write got, so recovery in the outer
 # finally can act on "EmptyClipboard already succeeded" even when a later
 # step (alloc/lock/SetClipboardData/Close) threw mid-sequence. Failure of any
@@ -1135,7 +1135,7 @@ Log "Mode: $(if ($ClipboardTest) { 'opt-in sentinel clipboard test (-ClipboardTe
 
 # ----- T0: static hygiene checks on THIS script (runs before any test) ------
 # Scan our own source (comment lines excluded) for the dangerous patterns the
-# previous rounds removed, plus the Round 10b clipboard invariants. Patterns
+# previous rounds removed, plus the clipboard invariants. Patterns
 # use [x] character classes or concatenated needles so the check lines cannot
 # match themselves.
 Log '--- T0: static hygiene checks (this script) ---'
@@ -1154,7 +1154,7 @@ Assert-True (-not ($srcCode -match 'Set-Clipboa[r]d')) `
     'T0-no-clipboard-cmdlet-set' 'no clipboard SET cmdlet in code (writes use exact Win32 helpers behind the gate)'
 Assert-True (-not ($srcCode -match 'Get-Clipboa[r]d')) `
     'T0-no-clipboard-cmdlet-get' 'no clipboard GET cmdlet in code (reads use exact Win32 helpers)'
-# --- Round 10b: destructive clipboard path confinement ---------------------
+# --- destructive clipboard path confinement ---------------------
 # Every destructive backend call (owner-open / empty / set) may only appear
 # inside the transaction region; the transaction call sites may only appear
 # in the guarded flow (sentinel write) and in the finally (recovery).
@@ -1677,7 +1677,7 @@ try {
     $fatalError = $_
     Log "FATAL: $($_.Exception.Message)"
 } finally {
-    # ---- 1) clipboard recovery (Round 10b): runs whenever any destructive
+    # ---- 1) clipboard recovery: runs whenever any destructive
     # ----    clipboard step MAY have executed -- even on early exceptions ----
     # "attempted" and "verified" are reported separately; a failed recovery is
     # an explicit assertion failure, never a swallowed exception or a fake OK.

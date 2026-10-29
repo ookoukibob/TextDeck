@@ -1,7 +1,7 @@
 ﻿# ---------------------------------------------------------------------------
 # e2e_tray_hotkey.ps1
 #
-# REAL acceptance for the shipped, user-facing behaviour of Round 12:
+# REAL acceptance for the shipped, user-facing behaviour:
 #   * the app lives in the system tray (window hidden)
 #   * a global hotkey starts typing into whatever window is in front
 #   * the hotkey does NOT steal the foreground window
@@ -155,7 +155,7 @@ function Wait-Snap([string]$p, [int]$sec) {
 }
 function Norm([string]$s) { if ($null -eq $s) { return "" }; return ($s -replace "`r`n", "`n") }
 
-# Round 13: the default global hotkeys are Ctrl+Alt+Shift+F9 (start) and
+# The default global hotkeys are Ctrl+Alt+Shift+F9 (start) and
 # Ctrl+Alt+Shift+F10 (stop) - the extra Shift and the two distinct function
 # keys make accidental collisions with other software far less likely.
 function Press-StartHotkey {
@@ -203,7 +203,7 @@ $typer = [IntPtr]::Zero
 $typerProc = $null
 # The harness needs DETERMINISTIC default bindings; back up the user's real
 # settings.ini and restore it verbatim on exit so no user configuration is
-# ever lost (Round 13 requirement: never destroy user data).
+# ever lost (requirement: never destroy user data).
 $iniPath = Join-Path $env:APPDATA "VirtualHIDTyper\settings.ini"
 $iniBackup = $null
 if (Test-Path $iniPath) { $iniBackup = [IO.File]::ReadAllBytes($iniPath) }
@@ -217,7 +217,7 @@ HotkeySchema=2
 '@ | Set-Content -Path $iniPath -Encoding UTF8
 } catch { }
 try {
-    Log "=== Round 12 tray + global hotkey E2E  $(Get-Date -Format "yyyy-MM-dd HH:mm:ss") ==="
+    Log "=== tray + global hotkey E2E  $(Get-Date -Format "yyyy-MM-dd HH:mm:ss") ==="
     Log "EXE: $Exe"
     Assert-True (Test-Path $Exe) "EXE-present" $Exe
 
@@ -265,7 +265,7 @@ try {
     $snap1 = Join-Path $ev "b1.txt"
     $w1 = $null
     try {
-        $w1 = Start-Target "R12 Target B" $snap1
+        $w1 = Start-Target "Target B" $snap1
         Assert-True (Force-Fg $w1.Hwnd) "B-target-focused" "hwnd=0x$($w1.Hwnd.ToString("X"))"
         # load the text into the (hidden) editor without showing the window
         Set-WmText ([TN]::GetDlgItem($typer, $IDC_EDIT_TEXT)) $t1
@@ -287,7 +287,7 @@ try {
     $snap2 = Join-Path $ev "c1.txt"
     $w2 = $null
     try {
-        $w2 = Start-Target "R12 Target C" $snap2
+        $w2 = Start-Target "Target C" $snap2
         Assert-True (Force-Fg $w2.Hwnd) "C-target-focused" "hwnd=0x$($w2.Hwnd.ToString("X"))"
         Set-WmText ([TN]::GetDlgItem($typer, $IDC_EDIT_TEXT)) $long
         Set-WmText ([TN]::GetDlgItem($typer, 1002)) "60"
@@ -311,7 +311,7 @@ try {
     $snap3 = Join-Path $ev "d1.txt"
     $w3 = $null
     try {
-        $w3 = Start-Target "R12 Target D" $snap3
+        $w3 = Start-Target "Target D" $snap3
         Assert-True (Force-Fg $w3.Hwnd) "D-target-focused" "hwnd=0x$($w3.Hwnd.ToString("X"))"
         Set-WmText ([TN]::GetDlgItem($typer, $IDC_EDIT_TEXT)) $long
         Set-WmText ([TN]::GetDlgItem($typer, 1002)) "60"
@@ -335,7 +335,7 @@ try {
     $snap4 = Join-Path $ev "e1.txt"
     $w4 = $null
     try {
-        $w4 = Start-Target "R12 Target E" $snap4
+        $w4 = Start-Target "Target E" $snap4
         Assert-True (Force-Fg $w4.Hwnd) "E-target-focused" "hwnd=0x$($w4.Hwnd.ToString("X"))"
         Set-WmText ([TN]::GetDlgItem($typer, $IDC_EDIT_TEXT)) $long
         Set-WmText ([TN]::GetDlgItem($typer, 1002)) "60"

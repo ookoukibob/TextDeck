@@ -1,5 +1,5 @@
 ﻿# ---------------------------------------------------------------------------
-# e2e_r13_hk_holder.ps1
+# e2e_hotkey_conflict.ps1
 #
 # Simulates ANOTHER application occupying one global hotkey combination via
 # the real Windows RegisterHotKey mechanism (thread-associated, NULL hwnd).
@@ -7,7 +7,7 @@
 # deterministically provoke ERROR_HOTKEY_ALREADY_REGISTERED (1409) in the
 # typer and verify the no-loss rollback behaviour.
 #
-# Usage: .\e2e_r13_hk_holder.ps1 -Mods 7 -Vk 0x7C -HoldSecs 300
+# Usage: .\e2e_hotkey_conflict.ps1 -Mods 7 -Vk 0x7C -HoldSecs 300
 #   Mods: MOD_ALT=1 MOD_CONTROL=2 MOD_SHIFT=4 MOD_WIN=8 (Ctrl+Alt+Shift = 7)
 #   Vk:   virtual-key code (F13 = 0x7C)
 # Prints HOLDER-REGISTERED and blocks; exits 0 on release.
@@ -24,7 +24,7 @@ param(
 # SPACE-wrapped (" path " -> first char 32); a leading space then makes
 # Set-Content -Path fail (drive ' C') and -Encoding misreport as
 # NamedParameterNotFound - the ready file never appeared while the chord WAS
-# registered (run9/run10's 40s-timeout WARNs). Trim BEFORE any use.
+# registered (long-timeout WARNs). Trim BEFORE any use.
 $ReadyFile = $ReadyFile.Trim().Trim('"').Trim()
 
 Add-Type @'

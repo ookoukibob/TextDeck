@@ -1,4 +1,4 @@
-# ---------------------------------------------------------------------------
+﻿# ---------------------------------------------------------------------------
 # test_install_gate.ps1  -- unit/mock tests for driver-tools\install_driver.ps1
 #
 # Scope (safe by construction):
@@ -196,7 +196,7 @@ if ($filesOk) {
     # Policy is MEASURED, not assumed. The expectation for every check below is
     # derived from the real Authenticode status of the current package, so this
     # section stays correct whether the package is unsigned (pre-signing state)
-    # or test-signed (post Round 11 signing).
+    # or test-signed (post signing).
     $policyReal = Get-TargetPolicy
     $policyKnown = ($null -ne $policyReal.SecureBoot) -and ($null -ne $policyReal.TestSigning)
 
@@ -211,7 +211,7 @@ if ($filesOk) {
         # Fail closed: an unanswerable policy must refuse regardless of signing.
         Check 'gate refuses when policy unknown (fail closed)' (-not $gateReal.Ok) "reason: $($gateReal.Reason)"
     } elseif ($catStatus -eq 'Valid') {
-        # Signed package: the gate must ACCEPT it (this is the Round 11 state).
+        # Signed package: the gate must ACCEPT it (the signed state).
         Check 'signed package accepted by gate' ($gateReal.Ok) "reason: $($gateReal.Reason)"
         Check 'acceptance is catalog-based' ($gateReal.Checks | Where-Object { $_.Name -like 'CAT signature status*' -and $_.Pass }) 'CAT Authenticode status Valid'
     } else {
@@ -337,7 +337,7 @@ Check 'SetupDiCreateDeviceInfo uses documented arg order + DICD_GENERATE_ID' (($
 # with 0xE0000205 (ERROR_INVALID_DEVINST_NAME) - verified by direct probe.
 Check 'device name is non-NULL and backslash-free' (($code.IndexOf('RootDeviceName = "TextDeckHidDriver"') -gt 0) -and ($code.IndexOf('SetupDiCreateDeviceInfo(set, null,') -lt 0)) 'DeviceName = "TextDeckHidDriver" (no backslash, not NULL)'
 
-# round 8: doc-driven INF source-path inventory + install-section semantics.
+# doc-driven INF source-path inventory + install-section semantics.
 # The declared file set must come from the audited parser (never a bare
 # path.Combine over raw keys), unsupported syntax must fail closed with a
 # reason, and one verified package may only yield a selection when every
@@ -349,7 +349,7 @@ Check 'declared files resolved only inside the package root (both layouts)' (($c
 Check 'no first-record preference when one package has several entries' ($code.IndexOf('r.Index = matchIdx[0]') -lt 0) 'selection index comes from the proven-unique section, not list order'
 Check 'install-section uniqueness enforced before any selection' (($code.IndexOf('report DIFFERENT install sections') -gt 0) -and ($code.IndexOf('report no install section name') -gt 0)) 'divergent or missing SectionName => ambiguity refusal'
 
-# round 9: CopyINF refused, SourceDisksNames arch priority, strict CopyFiles syntax
+# CopyINF refused, SourceDisksNames arch priority, strict CopyFiles syntax
 Check 'CopyINF refused with explicit reason (not silently skipped)' (($code.IndexOf('CopyINF recursively imports the complete external driver package') -gt 0) -and ($code.IndexOf('string.Equals(k, "CopyINF", StringComparison.OrdinalIgnoreCase)') -gt 0)) 'non-empty CopyINF => identity incomplete; case-insensitive key match in tokenized scan'
 Check 'SourceDisksNames arch priority implemented per disk id' (($code.IndexOf('TryLookupDiskPath(genericPaths, archPaths, diskid, out dpath, out diskFromArch)') -gt 0) -and ($code.IndexOf('defined twice in the same section with different paths') -gt 0)) 'arch layer wins per disk id; only same-section duplicates conflict'
 Check 'CopyFiles strict syntax: mixing/multi-@/empty-item/decorated-section refused' (($code.IndexOf('mixes @filename with file-list section names') -gt 0) -and ($code.IndexOf('lists multiple @filename entries') -gt 0) -and ($code.IndexOf('CopyFiles list ') -gt 0) -and ($code.IndexOf('does not support decorating a file-list-section name') -gt 0)) 'documented form @filename | file-list-section[,...] enforced'
@@ -891,7 +891,7 @@ FsPut "$storeJ\sub.sys"   ([byte[]](2,2,2,2))
 $idEvil = [PnpSetup]::BuildIdentity("$storeJ\pkg02.inf")
 Check 'R9d traversal in SourceDisksFiles subdir -> identity REFUSED with reason' ((-not [string]::IsNullOrEmpty($idEvil.Error)) -and ($idEvil.Error -match 'traversal')) "err=$($idEvil.Error)"
 
-# R10: ONE identity-verified package referenced by MULTIPLE driver records.
+# ONE identity-verified package referenced by MULTIPLE driver records.
 # Same package does NOT imply same install semantics: only records that all
 # report the SAME non-empty install section may de-duplicate; anything else
 # is an explicit ambiguity refusal (never a first-entry pick).
@@ -911,7 +911,7 @@ Check 'R10e null driver record -> Code=2 fail closed (field incompleteness)' (($
 $sel = [PnpSetup]::SelectTargetDriver((New-DrvList @(New-DrvRec '' $hw)), $tid, $hw)
 Check 'R10f record without INF name -> Code=2 fail closed (detail incomplete)' (($sel.Result.Code -eq 2) -and ($sel.Result.Message -match 'driver detail reported no INF name')) "msg=$($sel.Result.Message)"
 
-# R11 (round 9): a CopyINF reference blocks the WHOLE identity chain: the
+# A CopyINF reference blocks the WHOLE identity chain: the
 # external package(s) it recursively imports cannot be inventoried or hashed
 # here, so BuildIdentity refuses with NO key files, the package can never
 # match the target identity, and a driver record pointing at it can never
@@ -1004,7 +1004,7 @@ $inf5 = New-Inf @('[Version]','DriverVer = 01/01/2020,1.0.0.0','CatalogFile=k.ca
 $perr5 = 'sentinel'; $inv5 = [PnpSetup]::ParseInfInventory($inf5, [ref]$perr5)
 Check '6f C1.5 CopyFiles source name != dest: source hashed, dest ignored' (($null -eq $perr5) -and (Test-LeafSet (Get-InvLeaves $inv5) @('k.cat','src.sys')) -and ($null -eq (Get-Decl $inv5 'dst.sys'))) "err=$perr5 leaves=$(Get-InvLeaves $inv5)"
 # -- C1.6 CopyFiles documented alternatives (docs: @filename | sections) ------
-# NB round 9: the previously tested MIXED form '@direct.dll,FL' is NOT valid
+# NB: the previously tested MIXED form '@direct.dll,FL' is NOT valid
 # syntax (the official CopyFiles directive defines @filename and file-list
 # section names as mutually exclusive alternatives) - the valid forms are
 # tested separately here and the mixed form is REFUSED (see C1.16).
@@ -1135,7 +1135,7 @@ $inf14e = New-Inf @('[Version]','DriverVer = 01/01/2020,1.0.0.0','CatalogFile=k.
 $perr14e = 'sentinel'; $inv14e = [PnpSetup]::ParseInfInventory($inf14e, [ref]$perr14e)
 Check '6f C1.14e EMPTY CopyINF value -> not refused, no files added' (($null -eq $perr14e) -and (Test-LeafSet (Get-InvLeaves $inv14e) @('k.cat','a.sys'))) "err=$perr14e leaves=$(Get-InvLeaves $inv14e)"
 # (f) end-to-end blocking (BuildIdentity -> candidate selection) is covered
-#     by R11 in section [6c] on the in-memory FS.
+#     in section [6c] on the in-memory FS.
 # -- C1.15 SourceDisksNames architecture priority (per-disk-id, docs) --------
 $inf15a = New-Inf @('[Version]','DriverVer = 01/01/2020,1.0.0.0','CatalogFile=k.cat','[SourceDisksNames]','1 = "d",,,"\WinNT"','[SourceDisksFiles]','a.sys = 1')
 $perr15a = 'sentinel'; $inv15a = [PnpSetup]::ParseInfInventory($inf15a, [ref]$perr15a)

@@ -663,7 +663,7 @@ static const wchar_t* ModeShortName(InputMode m)
 
 static const wchar_t* ModeStatusText()
 {
-    // Focus-race advisory (Round 10a): the foreground check before each
+    // Focus-race advisory: the foreground check before each
     // send is not atomic with the send, so focus can still change in that
     // window. We cannot promise zero stray/lost chars on switch; the
     // advisory tells the user how to stay safe instead.
@@ -1268,7 +1268,7 @@ static bool ApplyHotkeys(HWND hwnd, const HotkeySpec& start, const HotkeySpec& s
         g_hkStop  = prevStop;   g_hkStopOk  = prevStopOk;
         // false = the caller must TELL the user the change was refused: the
         // restored ok flags describe the still-live old pair and would make
-        // any flag-based check report success (Round 13's H4 bug).
+        // any flag-based check report success (a previous flag-check bug).
         return false;
     }
 
@@ -2458,7 +2458,7 @@ static void HotkeyDlgOnOk(HWND dlg)
     // NOTE: the ok flags keep describing the LIVE pair - a refused change
     // rolls back to them - so the refusal MUST be read from the return
     // value. Checking the flags here silently swallowed every conflict
-    // (Round 13 H4): the dialog re-saved the unchanged pair and closed
+    // The dialog re-saved the unchanged pair and closed
     // with no conflict box and nothing committed.
     if (!ApplyHotkeys(g_hwndMain, g_hkDlg.start, g_hkDlg.stop)) {
         DWORD e = g_hkStartErr ? g_hkStartErr : g_hkStopErr;
