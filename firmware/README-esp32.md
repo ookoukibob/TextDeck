@@ -6,7 +6,7 @@ ESP32-S3 **独立运行的 USB HID 文本输入器**：文本持久化在 ESP32 
 
 **v1.2 起为单线方案**：一根原生 USB 线同时提供
 **CDC 控制端口**（二进制协议）和 **HID 键盘**（复合设备）。Windows 托盘程序
-TextDeck 的 Windows 托盘程序通过该 CDC 端口下发文本并远程开始/取消输入，用户按自己键盘上的
+通过该 CDC 端口下发文本并远程开始/取消输入，用户按自己键盘上的
 全局快捷键即可触发——不需要内核驱动、不需要测试签名、不需要管理员权限。
 
 板上的 **BOOT 键**仍可本地触发一次输入（可选兼容功能），但**不再是**日常使用的前提。
@@ -19,7 +19,7 @@ PowerShell 模拟 / 后台服务 / 网页配置页 / Wi-Fi 依赖。
 ```
 ┌──────────────────────────────┐                    ┌─────────────────────────────┐
 │ Windows 托盘程序             │  原生 USB (单线)   │        ESP32-S3 固件        │
-│ virtual-hid-work             │                    │ firmware/esp32_hid_text_device/ │
+│ TextDeck                     │                    │ firmware/esp32_hid_text_device/ │
 │  - 编辑/保存文本             │  CDC 控制端口  ───►│  - config_link: 协议解析    │
 │  - 全局快捷键                │  (二进制协议帧)    │  - text_store: SPIFFS 双槽位│
 │  - 开始/取消/状态查询        │                    │  - hid_typer: 非阻塞状态机  │
@@ -40,36 +40,32 @@ FTDI USB-UART（`VID_0403/PID_6001`）仍然保留，但只用于**刷写固件�
 恢复**，日常输入时**不需要**连接。
 
 
-## 2. 硬件与环境（本项目实测确认）
+## 2. 硬件与开发环境
 
-- 开发板标识 ESP32-N16R8；实际芯片 **ESP32-S3 (QFN56) rev v0.2**
-- Flash **16MB**，片内 PSRAM **8MB Octal**，240MHz 双核，MAC `<REDACTED_DEVICE_MAC>`
-- 工具链：Arduino IDE 2.3.10（内置 arduino-cli 1.5.1）、**arduino-esp32 3.3.12 (Espressif 官方稳定版)**
-- 分区方案：`esp32s3` 默认 **Default 4MB with spiffs**（`tools/partitions/default.csv`）；
-  `FlashSize=16M` 只影响 flash 容量声明，**不改分区方案**。本项目复用其中的
-  `spiffs` 分区（`0x290000`，1,441,792 字节），**不修改分区表**
-- 电脑端：Windows 10 Enterprise (x64, Build 26300)、Python 3.14.7 + Tkinter 9.0 + pySerial 3.5
-- 触发按键：**BOOT 键 = GPIO0**（内部上拉，低电平有效）——已通过实体按键实测确认
+- 目标硬件：ESP32-S3 开发板，建议使用具备 **16MB Flash / 8MB PSRAM** 的 ESP32-N16R8 类板卡。
+- 工具链：Arduino IDE 2、Arduino-ESP32 核心（3.x 系列）以及 Python 3；桌面端串口通信依赖见 `tools/esp32-desktop/requirements.txt`。
+- 分区方案：使用 Arduino-ESP32 核心提供的 **Default 4MB with spiffs** 分区方案；`FlashSize=16M` 用于声明芯片 Flash 容量，**不代表需要修改分区表**。固件使用该方案中的 `spiffs` 分区，不要求改写自定义分区表。
+- 触发按键：**BOOT 键 = GPIO0**（内部上拉，低电平有效）；不同开发板的板载按键接线可能不同，请以实际硬件为准。
 
 ## 3. 运行 Windows 桌面程序
 
 ```powershell
-cd <本项目目录>\desktop
-python hid_text_writer.py                 # 图形界面
+cd <本项目目录>\tools\esp32-desktop
+python .\hid_text_writer.py               # 图形界面
 ```
 
-依赖（本机已具备）：`pyserial==3.5`（见 `desktop/requirements.txt`）。
+依赖：`pyserial==3.5`（见 `tools/esp32-desktop/requirements.txt`）。
 
 命令行方式（与 GUI 按钮共用同一套逻辑）：
 
 ```powershell
-python hid_text_writer.py --port COM4 --ping                 # 查询设备
-python hid_text_writer.py --port COM4 --write "要写入的文本"  # 写入
-python hid_text_writer.py --port COM4 --read                 # 读回校验
+python .\hid_text_writer.py --port COMx --ping                 # 查询设备（将 COMx 替换为实际端口）
+python .\hid_text_writer.py --port COMx --write "要写入的文本"  # 写入
+python .\hid_text_writer.py --port COMx --read                   # 读回校验
 ```
 
 ### 写入流程
-1. 打开程序 → 自动枚举串口并优先选中 COM4（可用“刷新串口”重选）。
+1. 打开程序 → 自动枚举可用串口；选择开发板的 USB CDC 控制端口（可用“刷新串口”重选）。
 2. 在文本框输入内容 → 界面实时显示字节数/上限/字符支持范围。
 3. 点击“写入设备” → 程序先做字符与长度校验，再发协议帧。
 4. 成功判定：**必须收到设备有效响应帧**，状态栏显示
@@ -142,12 +138,11 @@ python hid_text_writer.py --port COM4 --read                 # 读回校验
 
 - **非阻塞状态机**：`beginTypeText()` 只校验并返回，字符由 `loop()` 中的
   `HidTyper::poll()` 按原节奏（80/8/15 ms）推进，因此输入期间串口命令照常处理。
-- **取消及时性**：实测 CANCEL 往返 34 ms（目标 ≤100–200 ms），`processed` 在
-  取消后不再增长，按键已释放。
+- **取消及时性**：收到有效 CANCEL 命令后会停止推进输入状态机并释放所有按键；
+  实际响应时间取决于 USB 与主机调度环境。
 - **单一任务**：输入中再次 START 返回 `ST_ERR_BUSY`，不重头输入、`session_id` 不变。
 - **主机租约**：主机发起的任务若 3000 ms 内没有任何有效协议帧，固件自动中止
   （`state=FAILED, reason=LEASE`）并释放按键；本地 BOOT 任务不受租约影响。
-  实测：宿主进程被杀后设备在租约到期时自行停下，剩余文本不补发。
 - **断连/错误**：USB HID 不就绪时 START 返回 `ST_ERR_HID_NOT_READY`；输入中
   断连立即中止且不自动续打。
 
@@ -172,7 +167,7 @@ $cli = "$env:LOCALAPPDATA\Programs\Arduino IDE\resources\app\lib\backend\resourc
 $FQBN = "esp32:esp32:esp32s3:FlashSize=16M,PSRAM=opi,USBMode=default,CDCOnBoot=default"
 
 & $cli compile --fqbn $FQBN <项目>\firmware\esp32_hid_text_device
-& $cli upload --port COM4 --fqbn $FQBN <项目>\firmware\esp32_hid_text_device
+& $cli upload --port COMx --fqbn $FQBN <项目>\firmware\esp32_hid_text_device  # 将 COMx 替换为实际刷写端口
 ```
 
 - `USBMode=default` = USB-OTG (TinyUSB)，HID 与 CDC 复合设备必需；
@@ -186,7 +181,7 @@ $FQBN = "esp32:esp32:esp32s3:FlashSize=16M,PSRAM=opi,USBMode=default,CDCOnBoot=d
 
 Arduino IDE 2 图形操作：打开 `firmware/esp32_hid_text_device`，
 开发板选 `ESP32S3 Dev Module`，菜单设置 Flash Size=16MB、PSRAM=OPI PSRAM、
-USB Mode=USB-OTG (TinyUSB)、USB CDC On Boot=Disabled、端口 COM4 → 验证/上传。
+USB Mode=USB-OTG (TinyUSB)、USB CDC On Boot=Disabled，并选择开发板对应的实际端口 → 验证/上传。
 
 ## 7. 项目结构
 
@@ -223,11 +218,11 @@ tools/
 |---|---|
 | 打开串口时板子可能复位一次 | 正常（自动复位电路）；程序内先做 RTS 复位脉冲 + 等待 `[boot] ready`，再由 PING 重试兜底 |
 | 长文本写入/读取偶尔超时 | 超时按帧长计算（见 `protocol.md` 与下方“超时机制”），10 KiB 在 115200 baud 下单程约 0.9 s，单次期限约 2.8 s；若仍超时通常是串口被占用或波特率不符，**不要**靠盲目加大固定超时解决 |
-| RTS 复位窗口读取时日志开头出现"单行重复回放"伪影（如数百~数万行 `eady=0`） | 已定位：FTDI 驱动传输层伪影，非固件行为（固件不可能只打印一行日志而记事本只收到一份文本）。空闲/正常读取实测 0 字节干扰，协议与功能不受影响。规避：复位时先开监听再复位，或忽略日志开头的重复行 |
+
 | 想清空已存文本 | 目前无删除命令，写入新文本覆盖即可（不需擦除整片 Flash） |
 | 升级后旧文本还在吗 | 在。旧 NVS 数据本固件**只读**，开机自动迁移到 `/textA.bin` 并回读验证；迁移成功也不删除 NVS，可反复恢复 |
 | 按键无反应 | 看串口日志：`HID not enumerated`=原生 USB 未连；`no valid text`=未写入文本 |
-| 烧录失败 | 先确认端口占用（桌面程序是否开着）、板型 FQBN、COM4 是否还是 FTDI；**不要**用全片擦除“解决” |
+| 烧录失败 | 先确认端口未被占用、板型 FQBN 与实际端口选择正确；**不要**用全片擦除“解决” |
 | 固件异常需恢复 | 重新 `arduino-cli upload` 正常固件即可；NVS 文本与应用分区分离，重新烧录不会删除已存文本 |
 
 ## 9. 串口超时机制（10 KiB 后不再用固定短窗）
