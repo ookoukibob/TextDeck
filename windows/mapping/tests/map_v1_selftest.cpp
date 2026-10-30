@@ -240,6 +240,49 @@ int main() {
         check(rec->heldKeys().empty(), "no-keys-held-after-stop", "");
     }
 
+    section("UTF-8 BOM tolerance for configuration files");
+    {
+        // PowerShell 5.1 writes a BOM for `> file` / `Out-File -Encoding UTF8`.
+        // Such a file must load exactly like the same file without the BOM.
+        const std::string bom = "\xEF\xBB\xBF";
+        const std::string plain = ExampleConfigJson();
+
+        {
+            auto rec2 = std::make_shared<RecordOutput>();
+            Engine e(rec2); std::vector<ConfigError> errs;
+            bool ok = LoadConfigText(plain, e, errs);
+            check(ok, "bom-absent-loads", ok ? "" : (errs.empty() ? "?" : errs[0].toText()));
+        }
+        {
+            auto rec2 = std::make_shared<RecordOutput>();
+            Engine e(rec2); std::vector<ConfigError> errs;
+            bool ok = LoadConfigText(bom + plain, e, errs);
+            check(ok, "bom-present-loads", ok ? "" : (errs.empty() ? "?" : errs[0].toText()));
+        }
+        {
+            // The BOM must not hide a genuine syntax error.
+            auto rec2 = std::make_shared<RecordOutput>();
+            Engine e(rec2); std::vector<ConfigError> errs;
+            bool ok = LoadConfigText(bom + "{ \"version\": 1, ", e, errs);
+            check(!ok, "bom-truncated-json-rejected", "");
+            check(!errs.empty(), "bom-truncated-json-has-message",
+                  errs.empty() ? "" : errs[0].toText());
+        }
+        {
+            auto rec2 = std::make_shared<RecordOutput>();
+            Engine e(rec2); std::vector<ConfigError> errs;
+            bool ok = LoadConfigText("{ \"version\": 1, ", e, errs);
+            check(!ok, "plain-truncated-json-rejected", "");
+        }
+        {
+            // A BOM in the middle of the document is still an error.
+            auto rec2 = std::make_shared<RecordOutput>();
+            Engine e(rec2); std::vector<ConfigError> errs;
+            bool ok = LoadConfigText("{ " + bom + "\"version\": 1 }", e, errs);
+            check(!ok, "inner-bom-rejected", "");
+        }
+    }
+
     std::printf("\n%d checks, %d passed, %d failed\n", g_check, g_pass, g_fail);
     return g_fail == 0 ? 0 : 1;
 }

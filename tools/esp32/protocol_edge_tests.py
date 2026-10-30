@@ -35,6 +35,14 @@ from hid_text_writer import (  # noqa: E402
 PASS, FAIL = "PASS", "FAIL"
 _results = []
 
+# Firmware version this suite is written against. Keep in sync with
+# firmware/esp32_hid_text_device/protocol.h:
+#   FW_VERSION_STR "1.2.0"  /  FW_VERSION 0x0102
+# (This constant used to be hard-coded as 0x0101 in the assertion below, which
+# made a correctly-flashed v1.2.0 device fail the PING version check.)
+EXPECTED_FW_VER = 0x0102
+PROTOCOL_VER = 0x01
+
 
 def log(f, msg):
     line = f"[{time.strftime('%Y-%m-%d %H:%M:%S')}] {msg}"
@@ -93,8 +101,8 @@ def main():
         check(f, "PING hid_ready 为合法 0/1 且已解析",
               isinstance(info.get("hid_ready"), bool),
               f"hid_ready={info.get('hid_ready')}")
-        check(f, "PING 协议/固件版本 (1.1.0)", info["proto"] == 1 and info["fw_ver"] == 0x0101,
-              f"proto=v{info['proto']} fw=0x{info['fw_ver']:04X}")
+        check(f, "PING 协议/固件版本 (1.2.0)", info["proto"] == 1 and info["fw_ver"] == EXPECTED_FW_VER,
+              f"proto=v{info['proto']} fw=0x{info['fw_ver']:04X} (expected 0x{EXPECTED_FW_VER:04X})")
         check(f, "PING max_text == 10240", info["max_text"] == 10240,
               f"max_text={info['max_text']}")
 

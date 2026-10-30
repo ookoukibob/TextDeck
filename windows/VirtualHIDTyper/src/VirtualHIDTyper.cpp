@@ -1,4 +1,4 @@
-// ---------------------------------------------------------------------------
+﻿// ---------------------------------------------------------------------------
 // VirtualHIDTyper.cpp
 //
 // Types text into the currently focused window using one of THREE explicit,
@@ -34,6 +34,7 @@
 #include <thread>
 #include <vector>
 #include <mutex>
+#include <cstdarg>
 
 #include "hid_mapping.h"
 #include "sw_input.h"
@@ -78,7 +79,8 @@ enum : int {
 };
 enum : UINT_PTR { TIMER_COUNTDOWN = 1, TIMER_SMOKE = 2 };
 enum : int { ID_HOTKEY_START = 1, ID_HOTKEY_STOP = 2,
-             ID_HOTKEY_TMP_START = 3, ID_HOTKEY_TMP_STOP = 4 };
+             ID_HOTKEY_TMP_START = 3, ID_HOTKEY_TMP_STOP = 4,
+             ID_HOTKEY_PANIC = 5, ID_HOTKEY_TMP_PANIC = 6 };
 
 // tray icon + its context menu
 #define TRAY_UID        1
@@ -98,6 +100,7 @@ enum : int {
     IDC_HK_OK     = 3004,
     IDC_HK_CANCEL = 3005,
     IDC_HK_DEFAULT = 3006,
+    IDC_HK_PANIC  = 3007,
 };
 
 #define WM_APP_STATUS   (WM_APP + 1) // lParam = LPWSTR (malloc'd, freed by receiver)
@@ -145,6 +148,9 @@ static HWND g_btnTestPort = nullptr;
 
 static InputMode         g_mode = MODE_ESP32;    // selected via radio / --mode
 static InputMode         g_runMode = MODE_ESP32; // mode of the CURRENT run
+// Set by LoadSettings when an old settings file has no InputMode record. The
+// modal prompt runs later, after the global hotkeys are already registered.
+static bool              g_modePromptPending = false;
 static bool              g_modeOverride = false;
 static InputMode         g_modeOverrideValue = MODE_ESP32;
 
@@ -173,6 +179,11 @@ static std::wstring     g_windowClass = L"VirtualHIDTyperWnd";
 static std::wstring     g_mutexName = L"VirtualHIDTyper.SingleInstance.v1";
 
 static std::atomic<bool>  g_running{false};
+// Last completed task, used to keep a "stopped" result on screen when the user
+// presses stop again right after the task already unwound (instead of replacing
+// it with "nothing is running").
+static DWORD              g_lastDoneTick = 0;
+static DoneReason         g_lastDoneReason = DONE_COMPLETED;
 static std::atomic<bool>  g_inCountdown{false};
 static int                g_countdownLeft = 0;
 static HANDLE             g_stopEvent = nullptr;
@@ -203,18 +214,47 @@ static std::mutex         g_taskLock;
 // overlap dramatically. Neither combination is reserved by Windows.
 static const HotkeySpec   kDefaultHkStart = { MOD_CONTROL | MOD_ALT | MOD_SHIFT, VK_F9 };
 static const HotkeySpec   kDefaultHkStop  = { MOD_CONTROL | MOD_ALT | MOD_SHIFT, VK_F10 };
+// Dedicated, MODIFIER-FREE stop key. The chord above is fine for stopping an
+// idle app, but pressing Ctrl/Alt/Shift while a remote HID keyboard is emitting
+// characters makes the host swallow those characters (they turn into shortcuts
+// instead of text). A bare key cannot do that: no modifier is ever held, and
+// RegisterHotKey consumes it so it never reaches the target either.
+// Pause is used because it produces no text, has no toggle state (unlike
+// ScrollLock/NumLock) and is bound by almost no application.
+static const HotkeySpec   kDefaultHkPanic = { 0, VK_PAUSE };
 static HotkeySpec         g_hkStart = kDefaultHkStart;   // Ctrl+Alt+Shift+F9
 static HotkeySpec         g_hkStop  = kDefaultHkStop;    // Ctrl+Alt+Shift+F10
+static HotkeySpec         g_hkPanic = kDefaultHkPanic;   // Pause (no modifiers)
 static bool               g_hkStartOk = false;   // registered successfully?
 static bool               g_hkStopOk  = false;
+static bool               g_hkPanicOk = false;
 static DWORD              g_hkStartErr = 0;      // last RegisterHotKey error
 static DWORD              g_hkStopErr  = 0;
+static DWORD              g_hkPanicErr = 0;
 // Id pair currently holding the ACTIVE bindings (0 = none registered yet).
 // ApplyHotkeys alternates between {ID_HOTKEY_START,ID_HOTKEY_STOP} and
 // {ID_HOTKEY_TMP_START,ID_HOTKEY_TMP_STOP} so a conflicting change can never
 // release the working pair before the replacement is provably registrable.
 static int                g_hkIdStart = 0;
 static int                g_hkIdStop  = 0;
+static int                g_hkIdPanic = 0;
+// Diagnostic switch: VHIDT_NO_NOREPEAT=1 registers hotkeys WITHOUT
+// MOD_NOREPEAT so a lost key-up (which makes the next press look like an
+// auto-repeat and gets suppressed) can be attributed instead of guessed.
+static bool HotkeyNoRepeatOff()
+{
+    static int cached = -1;
+    if (cached < 0) {
+        wchar_t buf[8] = L"";
+        cached = (GetEnvironmentVariableW(L"VHIDT_NO_NOREPEAT", buf, 8) > 0 &&
+                  buf[0] == L'1') ? 1 : 0;
+    }
+    return cached == 1;
+}
+static UINT HotkeyMods(UINT mods)
+{
+    return HotkeyNoRepeatOff() ? mods : (mods | MOD_NOREPEAT);
+}
 static std::wstring       g_trayTip;             // current tray tooltip text
 static bool               g_hotkeyDlgOpen = false;
 
@@ -239,6 +279,43 @@ static void AppendSmokeLog(const std::wstring& line)
                  st.wHour, st.wMinute, st.wSecond, st.wMilliseconds, line.c_str());
         fclose(f);
     }
+}
+
+// ---------------------------------------------------------------------------
+// Optional diagnostic trace (VHIDT_TRACE=<file path>). Off unless the variable
+// is set, so normal runs pay nothing. Used to prove where a stop request is
+// lost: hotkey arrival, stop-request acceptance, and the worker's observation
+// are timestamped with GetTickCount() so the three can be ordered.
+// ---------------------------------------------------------------------------
+static FILE*    g_traceFile = nullptr;
+static SRWLOCK  g_traceLock = SRWLOCK_INIT;
+
+static void Trace(const wchar_t* fmt, ...);
+
+static void TraceOpen()
+{
+    wchar_t p[32768] = L"";
+    DWORD n = GetEnvironmentVariableW(L"VHIDT_TRACE", p, 32768);
+    if (n == 0 || n >= 32768 || p[0] == 0) return;
+    FILE* f = nullptr;
+    if (_wfopen_s(&f, p, L"a, ccs=UTF-8") == 0 && f) {
+        g_traceFile = f;
+        Trace(L"--- trace opened, pid=%lu ---", (unsigned long)GetCurrentProcessId());
+    }
+}
+
+static void Trace(const wchar_t* fmt, ...)
+{
+    if (!g_traceFile) return;
+    wchar_t buf[1024];
+    va_list ap;
+    va_start(ap, fmt);
+    _vsnwprintf_s(buf, _TRUNCATE, fmt, ap);
+    va_end(ap);
+    AcquireSRWLockExclusive(&g_traceLock);
+    fwprintf(g_traceFile, L"[%8lu] %s\n", (unsigned long)GetTickCount(), buf);
+    fflush(g_traceFile);
+    ReleaseSRWLockExclusive(&g_traceLock);
 }
 
 static bool EnsureDirectory(const std::wstring& dir)
@@ -749,23 +826,13 @@ static void LoadSettings()
     if (modeLen == 0 || !modeBuf[0]) {
         const bool iniExisted =
             GetFileAttributesW(ini.c_str()) != INVALID_FILE_ATTRIBUTES;
-        if (iniExisted && !g_smokeMode && !g_customDataDir) {
-            int choice = MessageBoxW(g_hwndMain,
-                L"检测到旧版本设置文件，但没有记录输入模式。\n\n"
-                L"是 = 切换到【ESP32 USB HID 模式】\n"
-                L"     原生 USB 单线（CDC 控制 + HID 键盘），无需内核驱动，"
-                L"普通用户即可运行；仅支持 ASCII。\n\n"
-                L"否 = 保留【TextDeck HID 模式】\n"
-                L"     继续使用现有 VirtualHIDDriver，可能需要管理员权限。\n\n"
-                L"本程序不会静默改变旧配置；本次选择会保存，之后可在主窗口切换。",
-                L"选择输入模式", MB_YESNO | MB_ICONQUESTION | MB_DEFBUTTON1);
-            g_mode = (choice == IDYES) ? MODE_ESP32 : MODE_HID;
-            const wchar_t* chosen = (g_mode == MODE_ESP32) ? L"esp32" : L"hid";
-            WritePrivateProfileStringW(L"Main", L"InputMode", chosen,
-                                       ini.c_str());
-        } else {
-            g_mode = MODE_ESP32;
-        }
+        // The prompt itself is DEFERRED to ResolveDeferredModePrompt(): it is
+        // modal, and running it here would block startup before the global
+        // hotkeys are registered. A blocked startup left the app with no
+        // hotkeys at all, so the stop chord could never fire while a task
+        // started from the button was typing.
+        g_mode = MODE_ESP32;
+        g_modePromptPending = iniExisted && !g_smokeMode && !g_customDataDir;
     } else if (_wcsicmp(modeBuf, L"software") == 0) {
         g_mode = MODE_SOFTWARE;
     } else if (_wcsicmp(modeBuf, L"esp32") == 0) {
@@ -828,6 +895,27 @@ static void LoadSettings()
         g_hkStop  = kDefaultHkStop;
     }
 
+    // Dedicated stop key: an older settings.ini simply has no HotkeyStop2, in
+    // which case the built-in Pause stays in effect. A stored value that
+    // collides with start/stop is discarded for the same reason as above.
+    {
+        HotkeySpec filePanic = g_hkPanic;
+        GetPrivateProfileStringW(L"Main", L"HotkeyStop2", L"", hkBuf, 64, ini.c_str());
+        bool havePanic = false;
+        if (hkBuf[0]) {
+            unsigned m = 0, v = 0;
+            if (swscanf_s(hkBuf, L"%u,%u", &m, &v) == 2 && v != 0) {
+                filePanic.mods = m; filePanic.vk = v; havePanic = true;
+            }
+        }
+        if (havePanic && !SameHotkey(filePanic, g_hkStart) &&
+            !SameHotkey(filePanic, g_hkStop)) {
+            g_hkPanic = filePanic;
+        } else {
+            g_hkPanic = kDefaultHkPanic;
+        }
+    }
+
     std::wstring path = dir + L"\\text.txt";
     HANDLE h = CreateFileW(path.c_str(), GENERIC_READ, FILE_SHARE_READ, nullptr,
                            OPEN_EXISTING, FILE_ATTRIBUTE_NORMAL, nullptr);
@@ -847,6 +935,29 @@ static void LoadSettings()
         }
         CloseHandle(h);
     }
+}
+
+// Shows the "old settings file without a recorded mode" prompt. Called from
+// wWinMain AFTER ApplyHotkeys so a modal box can never keep the global start /
+// stop chords unregistered.
+static void ResolveDeferredModePrompt()
+{
+    if (!g_modePromptPending) return;
+    g_modePromptPending = false;
+    int choice = MessageBoxW(g_hwndMain,
+        L"检测到旧版本设置文件，但没有记录输入模式。\n\n"
+        L"是 = 切换到【ESP32 USB HID 模式】\n"
+        L"     原生 USB 单线（CDC 控制 + HID 键盘），无需内核驱动，"
+        L"普通用户即可运行；仅支持 ASCII。\n\n"
+        L"否 = 保留【TextDeck HID 模式】\n"
+        L"     继续使用现有 VirtualHIDDriver，可能需要管理员权限。\n\n"
+        L"本程序不会静默改变旧配置；本次选择会保存，之后可在主窗口切换。",
+        L"选择输入模式", MB_YESNO | MB_ICONQUESTION | MB_DEFBUTTON1);
+    g_mode = (choice == IDYES) ? MODE_ESP32 : MODE_HID;
+    const wchar_t* chosen = (g_mode == MODE_ESP32) ? L"esp32" : L"hid";
+    const std::wstring ini = SettingsDir() + L"\\settings.ini";
+    WritePrivateProfileStringW(L"Main", L"InputMode", chosen, ini.c_str());
+    Trace(L"mode prompt resolved: choice=%d mode=%d", choice, (int)g_mode);
 }
 
 static void SavePortSetting()
@@ -1149,6 +1260,18 @@ static std::wstring VkName(UINT vk)
     case VK_RETURN:    return L"Enter";
     case VK_TAB:       return L"Tab";
     case VK_ESCAPE:    return L"Esc";
+    case VK_PAUSE:     return L"Pause";
+    case VK_SCROLL:    return L"ScrollLock";
+    case VK_INSERT:    return L"Insert";
+    case VK_DELETE:    return L"Delete";
+    case VK_HOME:      return L"Home";
+    case VK_END:       return L"End";
+    case VK_PRIOR:     return L"PageUp";
+    case VK_NEXT:      return L"PageDown";
+    case VK_LEFT:      return L"Left";
+    case VK_RIGHT:     return L"Right";
+    case VK_UP:        return L"Up";
+    case VK_DOWN:      return L"Down";
     case VK_OEM_3:     return L"Grave";
     case VK_OEM_MINUS: return L"-";
     case VK_OEM_PLUS:  return L"=";
@@ -1203,6 +1326,9 @@ static bool SameHotkey(const HotkeySpec& a, const HotkeySpec& b)
 // refusal. g_hk*Err carries the failing GetLastError() of the refused half.
 static bool ApplyHotkeys(HWND hwnd, const HotkeySpec& start, const HotkeySpec& stop)
 {
+    Trace(L"ApplyHotkeys enter: start(m=%u,vk=%u) stop(m=%u,vk=%u) ok=%d/%d ids=%d/%d same=%d",
+          start.mods, start.vk, stop.mods, stop.vk, (int)g_hkStartOk, (int)g_hkStopOk,
+          g_hkIdStart, g_hkIdStop, (int)SameHotkey(start, stop));
     if (SameHotkey(start, stop)) {
         // Refuse the pair outright: two identical bindings are ambiguous and
         // the shell would only let one of them register anyway. Whatever is
@@ -1230,21 +1356,27 @@ static bool ApplyHotkeys(HWND hwnd, const HotkeySpec& start, const HotkeySpec& s
     if (!startUnchanged) {
         candStart = (g_hkIdStart == ID_HOTKEY_START) ? ID_HOTKEY_TMP_START
                                                      : ID_HOTKEY_START;
-        if (RegisterHotKey(hwnd, candStart, start.mods | MOD_NOREPEAT, start.vk)) {
+        if (RegisterHotKey(hwnd, candStart, HotkeyMods(start.mods), start.vk)) {
             startTaken = true;
+            Trace(L"RegisterHotKey START id=%d mods=%u vk=%u OK", candStart, start.mods, start.vk);
         } else {
             g_hkStartErr = GetLastError();
             candStart = 0;
+            Trace(L"RegisterHotKey START mods=%u vk=%u FAILED err=%lu", start.mods, start.vk,
+                  (unsigned long)g_hkStartErr);
         }
     }
     if (!stopUnchanged) {
         candStop = (g_hkIdStop == ID_HOTKEY_STOP) ? ID_HOTKEY_TMP_STOP
                                                   : ID_HOTKEY_STOP;
-        if (RegisterHotKey(hwnd, candStop, stop.mods | MOD_NOREPEAT, stop.vk)) {
+        if (RegisterHotKey(hwnd, candStop, HotkeyMods(stop.mods), stop.vk)) {
             stopTaken = true;
+            Trace(L"RegisterHotKey STOP id=%d mods=%u vk=%u OK", candStop, stop.mods, stop.vk);
         } else {
             g_hkStopErr = GetLastError();
             candStop = 0;
+            Trace(L"RegisterHotKey STOP mods=%u vk=%u FAILED err=%lu", stop.mods, stop.vk,
+                  (unsigned long)g_hkStopErr);
         }
     }
 
@@ -1287,6 +1419,63 @@ static bool ApplyHotkeys(HWND hwnd, const HotkeySpec& start, const HotkeySpec& s
     return true;
 }
 
+// The dedicated stop key is registered independently of the start/stop pair:
+// it has its own id pair, so a conflict on it never disturbs the other two, and
+// a rebind uses the same take-then-release order (never lose a working key).
+static bool ApplyPanicKey(HWND hwnd, const HotkeySpec& spec)
+{
+    Trace(L"ApplyPanicKey enter: mods=%u vk=%u ok=%d id=%d",
+          spec.mods, spec.vk, (int)g_hkPanicOk, g_hkIdPanic);
+    if (SameHotkey(spec, g_hkStart) || SameHotkey(spec, g_hkStop)) {
+        // Ambiguous: the shell would only deliver one of them.
+        g_hkPanicErr = ERROR_HOTKEY_ALREADY_REGISTERED;
+        Trace(L"ApplyPanicKey refused: same as start/stop");
+        return false;
+    }
+    if (g_hkPanicOk && SameHotkey(spec, g_hkPanic)) {
+        g_hkPanicErr = 0;
+        return true;
+    }
+    const int cand = (g_hkIdPanic == ID_HOTKEY_PANIC) ? ID_HOTKEY_TMP_PANIC
+                                                      : ID_HOTKEY_PANIC;
+    if (!RegisterHotKey(hwnd, cand, HotkeyMods(spec.mods), spec.vk)) {
+        g_hkPanicErr = GetLastError();
+        Trace(L"RegisterHotKey PANIC mods=%u vk=%u FAILED err=%lu", spec.mods,
+              spec.vk, (unsigned long)g_hkPanicErr);
+        return false;
+    }
+    if (g_hkIdPanic) UnregisterHotKey(hwnd, g_hkIdPanic);
+    g_hkIdPanic = cand;
+    g_hkPanic = spec;
+    g_hkPanicOk = true;
+    g_hkPanicErr = 0;
+    Trace(L"RegisterHotKey PANIC id=%d mods=%u vk=%u OK", cand, spec.mods, spec.vk);
+    return true;
+}
+
+// Applies all three bindings as one unit: either the requested set is in
+// effect, or nothing changed. The pair is applied first (it has the mature
+// rollback logic), then the panic key; if the panic key is refused the pair is
+// switched back, so the dialog's "原来的快捷键保持有效" message stays true.
+static bool ApplyAllHotkeys(HWND hwnd, const HotkeySpec& start,
+                            const HotkeySpec& stop, const HotkeySpec& panic)
+{
+    if (SameHotkey(start, stop) || SameHotkey(start, panic) ||
+        SameHotkey(stop, panic)) {
+        g_hkStartErr = g_hkStopErr = g_hkPanicErr = ERROR_INVALID_PARAMETER;
+        Trace(L"ApplyAllHotkeys refused: duplicate binding");
+        return false;
+    }
+    const HotkeySpec prevStart = g_hkStart, prevStop = g_hkStop;
+    if (!ApplyHotkeys(hwnd, start, stop)) return false;
+    if (!ApplyPanicKey(hwnd, panic)) {
+        // Undo the pair change so the user keeps exactly what was working.
+        ApplyHotkeys(hwnd, prevStart, prevStop);
+        return false;
+    }
+    return true;
+}
+
 // Full teardown used on real shutdown paths (both id pairs, plus whatever a
 // partially-failed start-up may have registered).
 static void UnregisterAllHotkeys(HWND hwnd)
@@ -1296,7 +1485,9 @@ static void UnregisterAllHotkeys(HWND hwnd)
     UnregisterHotKey(hwnd, ID_HOTKEY_STOP);
     UnregisterHotKey(hwnd, ID_HOTKEY_TMP_START);
     UnregisterHotKey(hwnd, ID_HOTKEY_TMP_STOP);
-    g_hkIdStart = g_hkIdStop = 0;
+    UnregisterHotKey(hwnd, ID_HOTKEY_PANIC);
+    UnregisterHotKey(hwnd, ID_HOTKEY_TMP_PANIC);
+    g_hkIdStart = g_hkIdStop = g_hkIdPanic = 0;
 }
 
 static std::wstring HotkeyStatusText()
@@ -1306,6 +1497,8 @@ static std::wstring HotkeyStatusText()
     s += g_hkStartOk ? L" (已注册)" : L" (注册失败)";
     s += L"    停止: " + HotkeyText(g_hkStop);
     s += g_hkStopOk ? L" (已注册)" : L" (注册失败)";
+    s += L"    专用停止: " + HotkeyText(g_hkPanic);
+    s += g_hkPanicOk ? L" (已注册)" : L" (注册失败)";
     return s;
 }
 
@@ -1324,6 +1517,8 @@ static bool SaveHotkeySettings()
     ok = (WritePrivateProfileStringW(L"Main", L"HotkeyStart", hk, ini.c_str()) != 0) && ok;
     swprintf_s(hk, L"%u,%u", g_hkStop.mods, g_hkStop.vk);
     ok = (WritePrivateProfileStringW(L"Main", L"HotkeyStop", hk, ini.c_str()) != 0) && ok;
+    swprintf_s(hk, L"%u,%u", g_hkPanic.mods, g_hkPanic.vk);
+    ok = (WritePrivateProfileStringW(L"Main", L"HotkeyStop2", hk, ini.c_str()) != 0) && ok;
     // Schema 2 = the Ctrl+Alt+Shift defaults. Stamped so the legacy-default
     // migration in LoadSettings never overwrites a real user choice.
     ok = (WritePrivateProfileStringW(L"Main", L"HotkeySchema", L"2", ini.c_str()) != 0) && ok;
@@ -1470,9 +1665,12 @@ static void TypingThread(std::wstring text, int intervalMs, bool shiftEnter, HWN
 
     g_sent = 0;
     g_skipped = 0;
+    Trace(L"TypingThread start len=%zu interval=%d shiftEnter=%d", text.size(), intervalMs,
+          (int)shiftEnter);
 
     for (size_t i = 0; i < text.size(); ++i) {
         if (WaitForSingleObject(g_stopEvent, 0) == WAIT_OBJECT_0) {
+            Trace(L"worker: stop observed BEFORE char %zu (sent=%ld)", i, (long)g_sent.load());
             reason = DONE_STOPPED;
             break;
         }
@@ -1508,15 +1706,18 @@ static void TypingThread(std::wstring text, int intervalMs, bool shiftEnter, HWN
             break;
         }
         g_sent.fetch_add(1);
+        Trace(L"worker: char %zu sent (sent=%ld)", i, (long)g_sent.load());
         PostMessageW(g_hwndMain, WM_APP_PROGRESS, (WPARAM)g_sent.load(),
                      (WPARAM)text.size());
 
         if (WaitForSingleObject(g_stopEvent, (DWORD)holdMs) == WAIT_OBJECT_0) {
+            Trace(L"worker: stop observed in hold after char %zu", i);
             reason = DONE_STOPPED;
             break;
         }
         if (gapMs > 0 &&
             WaitForSingleObject(g_stopEvent, (DWORD)gapMs) == WAIT_OBJECT_0) {
+            Trace(L"worker: stop observed in gap after char %zu", i);
             reason = DONE_STOPPED;
             break;
         }
@@ -1531,6 +1732,7 @@ static void TypingThread(std::wstring text, int intervalMs, bool shiftEnter, HWN
     }
 
     PostMessageW(g_hwndMain, WM_APP_DONE, (WPARAM)reason, (LPARAM)lastErr);
+    Trace(L"TypingThread end reason=%d sent=%ld", (int)reason, (long)g_sent.load());
 }
 
 // ----- software-mode sender (SendInput) ------------------------------------
@@ -1783,14 +1985,34 @@ static void Esp32TypingThread(std::string text, std::wstring port, HWND target)
             esp32::TypingStatus cs;
             std::wstring cerr;
             if (!Esp32Cancel(&cerr, &cs)) {
+                Trace(L"ESP32 stop: CANCEL FAILED (%s)", cerr.c_str());
                 fail(L"停止时发送 CANCEL 失败：" + cerr +
                      L"。设备将在主机租约 3 秒后自动停下并释放按键。");
-            } else if (cs.state == esp32::kTyCompleted) {
-                g_sent = cs.processed;
-                done(DONE_COMPLETED);
             } else {
-                g_sent = cs.processed;
-                done(DONE_STOPPED);
+                // The device has acknowledged CANCEL: processed is the last
+                // character count the device committed, i.e. the exact prefix
+                // the target may have received.
+                Trace(L"ESP32 stop: CANCEL acked state=%d processed=%u total=%u",
+                      (int)cs.state, (unsigned)cs.processed, (unsigned)cs.total);
+                uint32_t finalProcessed = cs.processed;
+                if (cs.state != esp32::kTyCompleted) {
+                    // The CANCEL reply can be one character behind (the counter
+                    // advances after the HID report is queued). One settled read
+                    // after the device is idle keeps "已输入 N 字符" matching what
+                    // the target actually received. Best effort only.
+                    esp32::TypingStatus settled{};
+                    std::wstring e2;
+                    if (g_esp32.GetStatus(&settled, &e2)) {
+                        if (settled.processed > finalProcessed)
+                            finalProcessed = settled.processed;
+                        Trace(L"ESP32 stop: settled state=%d processed=%u (cancel said %u)",
+                              (int)settled.state, (unsigned)settled.processed,
+                              (unsigned)cs.processed);
+                    }
+                }
+                g_sent = finalProcessed;
+                done(cs.state == esp32::kTyCompleted ? DONE_COMPLETED
+                                                     : DONE_STOPPED);
             }
             return;
         }
@@ -1938,7 +2160,10 @@ static void CancelCountdown(const wchar_t* why)
     CancelEsp32Countdown();
     KillTimer(g_hwndMain, TIMER_COUNTDOWN);
     g_inCountdown = false;
-    g_task.store(TS_IDLE);
+    // Never publish IDLE while a worker is still driving the keyboard: the UI
+    // would re-enable "start" (and accept a second task) while characters are
+    // still going out.
+    if (!g_running) g_task.store(TS_IDLE);
     if (g_staticStatus) SetWindowTextW(g_staticStatus, why);
     UpdateTrayIcon();
 }
@@ -1947,7 +2172,11 @@ static void CancelCountdown(const wchar_t* why)
 // no-focus-stealing path: no countdown, no activation, no modal dialog.
 static void BeginTyping(bool viaHotkey)
 {
+    // Same lifecycle boundary as BeginEsp32Typing(): countdown state must not
+    // survive into a live task.
     g_inCountdown = false;
+    g_esp32CountdownArmed = false;
+    KillTimer(g_hwndMain, TIMER_COUNTDOWN);
 
     HWND target = GetForegroundWindow();
     if (!IsUsableTarget(target)) {
@@ -2103,16 +2332,18 @@ static void BeginTyping(bool viaHotkey)
     g_runMode = g_mode;   // freeze the mode of THIS run for status/result text
     g_running = true;
     g_task.store(TS_TYPING);
+    Trace(L"BeginTyping: mode=%d len=%zu interval=%d shiftEnter=%d target=%p",
+          (int)g_runMode, norm.size(), interval, (int)shiftEnter, (void*)target);
     if (g_btnStart) EnableWindow(g_btnStart, FALSE);
     if (g_btnStop) EnableWindow(g_btnStop, TRUE);
     if (g_radioHid) EnableWindow(g_radioHid, FALSE);   // mode fixed during a run
     if (g_radioSw) EnableWindow(g_radioSw, FALSE);
 
     wchar_t st[240];
-    swprintf_s(st, L"%s输入中… 目标窗口 0x%p。中止：%s 或托盘“停止输入”。"
+    swprintf_s(st, L"%s输入中… 目标窗口 0x%p。中止：%s（专用键）或 %s，或托盘“停止输入”。"
                L"切换焦点将自动停止。",
                g_runMode == MODE_SOFTWARE ? L"【软件输入模式】" : L"【TextDeck HID 模式】",
-               target, HotkeyText(g_hkStop).c_str());
+               target, HotkeyText(g_hkPanic).c_str(), HotkeyText(g_hkStop).c_str());
     if (g_staticStatus) SetWindowTextW(g_staticStatus, st);
     SetTrayDetail(std::wstring(g_runMode == MODE_SOFTWARE
                     ? L"软件输入模式" : L"TextDeck HID 模式") + L" - 正在输入");
@@ -2149,6 +2380,25 @@ static void BeginTyping(bool viaHotkey);
 static void BeginEsp32Typing(const std::string& ascii, const std::wstring& port,
                              HWND target)
 {
+    // The caller may hand us the pending stash by reference (g_esp32PendingText /
+    // g_esp32PendingPort below); take copies before the stash is cleared, or the
+    // references would alias the emptied strings and the worker would open "".
+    std::string  textCopy = ascii;
+    std::wstring portCopy = port;
+
+    // Lifecycle boundary: the optional 3 s countdown hands over to REAL typing
+    // here. Leaving g_inCountdown set (as this function used to) made every
+    // later RequestStop() take the "cancel the countdown" branch: the UI said
+    // "已取消（未发送任何按键）" while the device kept typing the whole buffer.
+    // Clearing it at this exact node keeps the countdown state and the live
+    // task state mutually exclusive.
+    g_inCountdown = false;
+    g_esp32CountdownArmed = false;
+    KillTimer(g_hwndMain, TIMER_COUNTDOWN);
+    g_esp32PendingText.clear();
+    g_esp32PendingPort.clear();
+    g_esp32PendingTarget = nullptr;
+
     if (g_worker.joinable()) g_worker.join();
     if (g_stopEvent) CloseHandle(g_stopEvent);
     g_stopEvent = CreateEventW(nullptr, TRUE, FALSE, nullptr);
@@ -2166,14 +2416,14 @@ static void BeginEsp32Typing(const std::string& ascii, const std::wstring& port,
     if (g_btnTestPort) EnableWindow(g_btnTestPort, FALSE);
 
     wchar_t st[256];
-    swprintf_s(st, L"【ESP32 USB HID 模式】输入中… 目标窗口 0x%p。中止：%s 或托盘“停止输入”。"
+    swprintf_s(st, L"【ESP32 USB HID 模式】输入中… 目标窗口 0x%p。中止：%s（专用键）或 %s，或托盘“停止输入”。"
                L"切换焦点将自动停止。",
-               target, HotkeyText(g_hkStop).c_str());
+               target, HotkeyText(g_hkPanic).c_str(), HotkeyText(g_hkStop).c_str());
     if (g_staticStatus) SetWindowTextW(g_staticStatus, st);
     SetTrayDetail(L"ESP32 USB HID 模式 - 正在输入");
     UpdateTrayIcon();
 
-    g_worker = std::thread([text = ascii, port, target]() {
+    g_worker = std::thread([text = textCopy, port = portCopy, target]() {
         Esp32TypingThread(std::move(text), port, target);
     });
 }
@@ -2209,12 +2459,31 @@ static void RequestStart(bool viaHotkey)
 // Single stop entry point for the hotkey, the tray menu and the button.
 static void RequestStop()
 {
-    if (g_inCountdown || g_esp32CountdownArmed) {
+    const int s = g_task.load();
+    // A live worker outranks the countdown flags. If characters are being sent
+    // right now, a stop must reach the worker (and the device) even if some
+    // countdown flag was left behind: reporting "nothing was sent" while the
+    // device keeps typing is the exact failure this ordering prevents.
+    const bool live = g_running &&
+                      (s == TS_STARTING || s == TS_TYPING || s == TS_STOPPING);
+    Trace(L"RequestStop enter: task=%d running=%d countdown=%d esp32cd=%d event=%p",
+          s, (int)g_running, (int)g_inCountdown, (int)g_esp32CountdownArmed,
+          (void*)g_stopEvent);
+    if (!live && (g_inCountdown || g_esp32CountdownArmed)) {
+        Trace(L"RequestStop -> cancel countdown");
         CancelCountdown(L"已取消（未发送任何按键）。");
         return;
     }
-    int s = g_task.load();
-    if ((s == TS_TYPING || s == TS_STARTING) && g_stopEvent) {
+    if (live && g_stopEvent) {
+        if (s == TS_STOPPING) {
+            // Repeated stop (hotkey + button, or a double press): the worker is
+            // already unwinding. Re-signalling is harmless and idempotent; the
+            // pending I/O must NOT be aborted again, or the in-flight CANCEL
+            // itself would be cancelled.
+            Trace(L"RequestStop -> repeated while stopping (re-signalling only)");
+            SetEvent(g_stopEvent);
+            return;
+        }
         g_task.store(TS_STOPPING);
         if (g_staticStatus)
             SetWindowTextW(g_staticStatus, L"正在停止…（释放所有按键，不再发送后续字符）");
@@ -2223,9 +2492,22 @@ static void RequestStop()
         // CANCEL jumps ahead of the next status poll instead of queueing.
         g_esp32.AbortPendingIo();
         SetEvent(g_stopEvent);
+        Trace(L"RequestStop -> signalled (task was %d)", s);
         return;
     }
-    if (g_staticStatus) SetWindowTextW(g_staticStatus, L"当前没有进行中的输入任务。");
+    Trace(L"RequestStop -> IGNORED (task=%d, running=%d, event=%p)", s,
+          (int)g_running, (void*)g_stopEvent);
+    if (g_staticStatus) {
+        // A stop pressed right after a stop already took effect (double click,
+        // hotkey + button) must not wipe the "已停止…" result the user is
+        // reading, and must never look like a second, contradictory outcome.
+        const DWORD since = g_lastDoneTick ? (GetTickCount() - g_lastDoneTick) : 0xFFFFFFFF;
+        if (g_lastDoneTick && g_lastDoneReason == DONE_STOPPED && since < 1500) {
+            Trace(L"RequestStop -> already stopped %lu ms ago, status kept", (unsigned long)since);
+            return;
+        }
+        SetWindowTextW(g_staticStatus, L"当前没有进行中的输入任务。");
+    }
 }
 
 static void OnStart() { RequestStart(false); }
@@ -2368,7 +2650,8 @@ static void OnTrayCommand(int id)
 struct HotkeyDlgState {
     HotkeySpec start;
     HotkeySpec stop;
-    int        captureTarget;   // 0 = none, 1 = start, 2 = stop
+    HotkeySpec panic;
+    int        captureTarget;   // 0 = none, 1 = start, 2 = stop, 3 = panic
     HHOOK      kbHook;
     HWND       hwnd;
     bool       done;            // ends the modal pump (set by the dialog wndproc)
@@ -2425,11 +2708,14 @@ static LRESULT CALLBACK HotkeyKbHook(int code, WPARAM wParam, LPARAM lParam)
                 mods |= MOD_WIN;
 
             HotkeySpec spec = { mods, vk };
-            HWND edit = GetDlgItem(g_hkDlg.hwnd,
-                          g_hkDlg.captureTarget == 1 ? IDC_HK_START : IDC_HK_STOP);
+            int targetId = g_hkDlg.captureTarget == 1 ? IDC_HK_START
+                         : g_hkDlg.captureTarget == 2 ? IDC_HK_STOP
+                                                      : IDC_HK_PANIC;
+            HWND edit = GetDlgItem(g_hkDlg.hwnd, targetId);
             if (edit) SetWindowTextW(edit, HotkeyText(spec).c_str());
-            if (g_hkDlg.captureTarget == 1) g_hkDlg.start = spec;
-            else                            g_hkDlg.stop  = spec;
+            if (g_hkDlg.captureTarget == 1)      g_hkDlg.start = spec;
+            else if (g_hkDlg.captureTarget == 2) g_hkDlg.stop  = spec;
+            else                                 g_hkDlg.panic = spec;
             g_hkDlg.captureTarget = 0;
             return 1;   // consumed: the chord must not reach other apps
         }
@@ -2447,8 +2733,12 @@ static LRESULT CALLBACK HotkeyKbHook(int code, WPARAM wParam, LPARAM lParam)
 
 static void HotkeyDlgOnOk(HWND dlg)
 {
-    if (SameHotkey(g_hkDlg.start, g_hkDlg.stop)) {
-        MessageBoxW(dlg, L"开始和停止不能使用相同的快捷键组合。",
+    if (SameHotkey(g_hkDlg.start, g_hkDlg.stop) ||
+        SameHotkey(g_hkDlg.start, g_hkDlg.panic) ||
+        SameHotkey(g_hkDlg.stop, g_hkDlg.panic)) {
+        MessageBoxW(dlg,
+                    L"开始、停止与专用停止键不能使用相同的按键。\n\n"
+                    L"专用停止键（默认 Pause）可以不带任何修饰键。",
                     L"快捷键冲突", MB_OK | MB_ICONWARNING);
         return;
     }
@@ -2460,20 +2750,22 @@ static void HotkeyDlgOnOk(HWND dlg)
     // value. Checking the flags here silently swallowed every conflict
     // The dialog re-saved the unchanged pair and closed
     // with no conflict box and nothing committed.
-    if (!ApplyHotkeys(g_hwndMain, g_hkDlg.start, g_hkDlg.stop)) {
-        DWORD e = g_hkStartErr ? g_hkStartErr : g_hkStopErr;
+    if (!ApplyAllHotkeys(g_hwndMain, g_hkDlg.start, g_hkDlg.stop, g_hkDlg.panic)) {
+        DWORD e = g_hkStartErr ? g_hkStartErr
+                : g_hkStopErr  ? g_hkStopErr
+                               : g_hkPanicErr;
         wchar_t m[560];
         if (e == ERROR_HOTKEY_ALREADY_REGISTERED) {
             swprintf_s(m,
-                L"该组合已被其他程序占用（错误码 %lu："
+                L"该按键已被其他程序占用（错误码 %lu："
                 L"全局热键已被注册）。\n\n"
                 L"原来的快捷键保持有效，未做任何更改。"
-                L"请换一个组合再试。", e);
+                L"请换一个按键再试。", e);
         } else {
             swprintf_s(m,
                 L"快捷键注册失败（错误码 %lu）。\n\n"
                 L"原来的快捷键保持有效，未做任何更改。"
-                L"请换一个组合再试。", e);
+                L"请换一个按键再试。", e);
         }
         MessageBoxW(dlg, m, L"快捷键注册失败", MB_OK | MB_ICONWARNING);
         return;
@@ -2499,10 +2791,13 @@ static void HotkeyDlgOnDefault(HWND dlg)
     // leaves the current bindings untouched.
     g_hkDlg.start = kDefaultHkStart;
     g_hkDlg.stop  = kDefaultHkStop;
+    g_hkDlg.panic = kDefaultHkPanic;
     SetWindowTextW(GetDlgItem(dlg, IDC_HK_START),
                    HotkeyText(g_hkDlg.start).c_str());
     SetWindowTextW(GetDlgItem(dlg, IDC_HK_STOP),
                    HotkeyText(g_hkDlg.stop).c_str());
+    SetWindowTextW(GetDlgItem(dlg, IDC_HK_PANIC),
+                   HotkeyText(g_hkDlg.panic).c_str());
 }
 
 static LRESULT CALLBACK HotkeyDlgWndProc(HWND dlg, UINT msg,
@@ -2522,6 +2817,10 @@ static LRESULT CALLBACK HotkeyDlgWndProc(HWND dlg, UINT msg,
         }
         if (id == IDC_HK_STOP && (evt == BN_CLICKED || evt == EN_SETFOCUS)) {
             g_hkDlg.captureTarget = 2;
+            return 0;
+        }
+        if (id == IDC_HK_PANIC && (evt == BN_CLICKED || evt == EN_SETFOCUS)) {
+            g_hkDlg.captureTarget = 3;
             return 0;
         }
         if (evt == BN_CLICKED) {
@@ -2546,6 +2845,7 @@ static void ShowHotkeyDialog()
     g_hotkeyDlgOpen = true;
     g_hkDlg.start = g_hkStart;
     g_hkDlg.stop  = g_hkStop;
+    g_hkDlg.panic = g_hkPanic;
 
     // Build the dialog from a template at runtime (no .rc file needed).
     struct { DLGTEMPLATE tmpl; WORD menu, cls, title; } tpl = {};
@@ -2559,7 +2859,7 @@ static void ShowHotkeyDialog()
     HWND dlg = CreateWindowExW(WS_EX_DLGMODALFRAME | WS_EX_TOPMOST,
         L"#32770", L"快捷键设置",
         WS_POPUP | WS_CAPTION | WS_SYSMENU | DS_MODALFRAME,
-        CW_USEDEFAULT, CW_USEDEFAULT, 580, 300,
+        CW_USEDEFAULT, CW_USEDEFAULT, 580, 340,
         g_hwndMain, nullptr, GetModuleHandleW(nullptr), nullptr);
     if (!dlg) { g_hotkeyDlgOpen = false; return; }
 
@@ -2582,17 +2882,21 @@ static void ShowHotkeyDialog()
     HWND eStart = mk(L"EDIT", L"", WS_BORDER | ES_READONLY, 112, 18, 380, 24, IDC_HK_START);
     mk(L"STATIC", L"紧急停止:", 0, 16, 56, 90, 22, -1);
     HWND eStop  = mk(L"EDIT", L"", WS_BORDER | ES_READONLY, 112, 54, 380, 24, IDC_HK_STOP);
+    mk(L"STATIC", L"专用停止键:", 0, 16, 92, 90, 22, -1);
+    HWND ePanic = mk(L"EDIT", L"", WS_BORDER | ES_READONLY, 112, 90, 380, 24, IDC_HK_PANIC);
     mk(L"STATIC",
-       L"点击输入框后直接按组合键（需含 Ctrl/Alt/Shift/Win 之一）。\r\n"
-       L"开始与停止不能相同；组合被其他程序占用时会提示并保留原设置。",
-       0, 16, 96, 540, 44, IDC_HK_INFO);
-    HWND ok = mk(L"BUTTON", L"确定", BS_DEFPUSHBUTTON, 300, 220, 90, 32, IDC_HK_OK);
-    HWND cancel = mk(L"BUTTON", L"取消", 0, 400, 220, 90, 32, IDC_HK_CANCEL);
-    HWND deflt = mk(L"BUTTON", L"恢复默认", 0, 16, 220, 100, 32, IDC_HK_DEFAULT);
+       L"点击输入框后直接按键（开始/紧急停止建议含 Ctrl/Alt/Shift/Win 之一）。\r\n"
+       L"专用停止键可只用单个按键：它不按任何修饰键，因此不会把正在发送的 HID 字符吞成快捷键。\r\n"
+       L"三者不能相同；按键被其他程序占用时会提示并保留原设置。默认为 Pause。",
+       0, 16, 132, 540, 66, IDC_HK_INFO);
+    HWND ok = mk(L"BUTTON", L"确定", BS_DEFPUSHBUTTON, 300, 250, 90, 32, IDC_HK_OK);
+    HWND cancel = mk(L"BUTTON", L"取消", 0, 400, 250, 90, 32, IDC_HK_CANCEL);
+    HWND deflt = mk(L"BUTTON", L"恢复默认", 0, 16, 250, 100, 32, IDC_HK_DEFAULT);
     (void)ok; (void)cancel; (void)deflt;
 
     SetWindowTextW(eStart, HotkeyText(g_hkDlg.start).c_str());
     SetWindowTextW(eStop,  HotkeyText(g_hkDlg.stop).c_str());
+    SetWindowTextW(ePanic, HotkeyText(g_hkDlg.panic).c_str());
 
     g_hkDlg.hwnd = dlg;
     g_hkDlg.captureTarget = 0;
@@ -3046,14 +3350,27 @@ static LRESULT CALLBACK WndProc(HWND hwnd, UINT msg, WPARAM wParam, LPARAM lPara
         return 0;
 
     case WM_HOTKEY:
+        Trace(L"WM_HOTKEY received id=%u", (unsigned)wParam);
+        // The mode prompt is modal and runs before the app is fully initialised;
+        // hotkeys are already registered at that point (so they are never lost),
+        // but acting on them mid-prompt would start typing behind a dialog.
+        if (g_modePromptPending) {
+            Trace(L"WM_HOTKEY ignored: mode prompt pending");
+            return 0;
+        }
         // The global start hotkey must NOT show or activate this window: the
         // foreground window at this instant is the user typing target. At any
         // moment only ONE of each id pair is registered (the switching
         // scheme), so both ids can safely map to the same action.
         if (wParam == ID_HOTKEY_START || wParam == ID_HOTKEY_TMP_START)
             RequestStart(true);
-        if (wParam == ID_HOTKEY_STOP || wParam == ID_HOTKEY_TMP_STOP)
+        if (wParam == ID_HOTKEY_STOP || wParam == ID_HOTKEY_TMP_STOP ||
+            wParam == ID_HOTKEY_PANIC || wParam == ID_HOTKEY_TMP_PANIC) {
+            Trace(L"stop hotkey id=%u (%s)", (unsigned)wParam,
+                  (wParam == ID_HOTKEY_PANIC || wParam == ID_HOTKEY_TMP_PANIC)
+                      ? L"dedicated" : L"chord");
             RequestStop();
+        }
         return 0;
 
     case WM_APP_SHOWME:
@@ -3115,7 +3432,11 @@ static LRESULT CALLBACK WndProc(HWND hwnd, UINT msg, WPARAM wParam, LPARAM lPara
     case WM_APP_DONE: {
         DoneReason reason = (DoneReason)wParam;
         DWORD err = (DWORD)lParam;
+        Trace(L"WM_APP_DONE reason=%d err=%lu sent=%ld task=%d", (int)reason,
+              (unsigned long)err, (long)g_sent.load(), g_task.load());
         g_running = false;
+        g_lastDoneTick = GetTickCount();
+        g_lastDoneReason = reason;
         EnableWindow(g_btnStart, TRUE);
         EnableWindow(g_btnStop, FALSE);
         EnableWindow(g_radioHid, TRUE);   // mode selectable again after a run
@@ -3224,6 +3545,8 @@ int APIENTRY wWinMain(HINSTANCE hInst, HINSTANCE, LPWSTR cmdLine, int)
     // override must win over the persisted value below.
     if (!ParseCommandLine()) return 1;
     if (g_smokeMode && g_smokeLogPath.empty()) g_smokeLogPath = L"smoke.log";
+    TraceOpen();
+    Trace(L"wWinMain: mode=%d dataDir=%s", (int)g_mode, g_dataDir.c_str());
 
     // --- single instance -----------------------------------------------------
     // A named mutex makes a second double-click a no-op: without it the user
@@ -3323,8 +3646,21 @@ int APIENTRY wWinMain(HINSTANCE hInst, HINSTANCE, LPWSTR cmdLine, int)
     // Real global hotkeys (RegisterHotKey/WM_HOTKEY). The persisted bindings
     // are applied as a PAIR so a failure on either one is reported precisely
     // instead of silently leaving a half-configured pair.
-    ApplyHotkeys(hwnd, g_hkStart, g_hkStop);
+    Trace(L"pre-ApplyHotkeys: start(m=%u,vk=%u) stop(m=%u,vk=%u) panic(m=%u,vk=%u)",
+          g_hkStart.mods, g_hkStart.vk, g_hkStop.mods, g_hkStop.vk,
+          g_hkPanic.mods, g_hkPanic.vk);
+    ApplyAllHotkeys(hwnd, g_hkStart, g_hkStop, g_hkPanic);
+    Trace(L"post-ApplyHotkeys: ok=%d/%d/%d err=%lu/%lu/%lu ids=%d/%d/%d",
+          (int)g_hkStartOk, (int)g_hkStopOk, (int)g_hkPanicOk,
+          (unsigned long)g_hkStartErr, (unsigned long)g_hkStopErr,
+          (unsigned long)g_hkPanicErr, g_hkIdStart, g_hkIdStop, g_hkIdPanic);
     if (g_staticHotkeys) SetWindowTextW(g_staticHotkeys, HotkeyStatusText().c_str());
+
+    // Modal mode prompt is resolved only now: the global hotkeys above are
+    // already registered, so a user who ignores the box still has a working
+    // start/stop chord (previously this prompt blocked registration entirely).
+    ResolveDeferredModePrompt();
+
     // Re-render the mode banner and title now that the real bindings are known.
     SetMode(g_mode, true);
 

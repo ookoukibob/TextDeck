@@ -336,6 +336,36 @@ try {
     Assert-True ($title -match '\[TextDeck HID 模式\]') 'P3-hid-mode-selected' "title=$title"
     Assert-True (-not ($title -match 'SendInput')) 'P3-not-software-mode' 'title carries no SendInput marker'
 
+    # ---------------------------------------------------------------------
+    # P4: the global hotkeys must be LIVE at this point. settings.ini here
+    # deliberately has no InputMode record (that is what a file written by an
+    # older build looks like), which used to trigger a modal "choose mode"
+    # prompt during startup that ran BEFORE RegisterHotKey. The prompt blocked
+    # registration, so the stop chord could never fire while a task started
+    # from the button was typing: the run reached 100% and reported success.
+    # ---------------------------------------------------------------------
+    Log '--- P4: global hotkeys registered despite a legacy settings.ini ---'
+    if (-not ('HotkeyOwnerProbe' -as [type])) {
+        Add-Type -TypeDefinition @"
+using System;
+using System.Runtime.InteropServices;
+public class HotkeyOwnerProbe {
+  [DllImport("user32.dll", SetLastError=true)] public static extern bool RegisterHotKey(IntPtr h, int id, uint mods, uint vk);
+  [DllImport("user32.dll", SetLastError=true)] public static extern bool UnregisterHotKey(IntPtr h, int id);
+}
+"@
+    }
+    foreach ($hk in @(
+        @{ n = 'start Ctrl+Alt+Shift+F9'; m = 0x4007; v = 0x78 },
+        @{ n = 'stop  Ctrl+Alt+X';        m = 0x4003; v = 0x58 })) {
+        $free = [HotkeyOwnerProbe]::RegisterHotKey([IntPtr]::Zero, 9901, [uint32]$hk.m, [uint32]$hk.v)
+        $err  = [Runtime.InteropServices.Marshal]::GetLastWin32Error()
+        if ($free) { [void][HotkeyOwnerProbe]::UnregisterHotKey([IntPtr]::Zero, 9901) }
+        # 1409 = ERROR_HOTKEY_ALREADY_REGISTERED -> the app owns it
+        Assert-True (-not $free) ("P4-hotkey-registered-" + ($hk.n -replace '[^A-Za-z0-9]', '')) `
+            ("$($hk.n): free=$free err=$err (1409 means the app owns it; free=True means it never registered)")
+    }
+
     Log '--- T1: real HID text (EN letters, digits, punctuation, Enter) ---'
     $t1 = ("Hello World 12345!" + $CRLF + "Punct: ,.;:'" + $DQ + "[]{}()<>/?+-=_@#$%&*" + $CRLF + "AbCdEf 67890 END")
     $snap1 = Join-Path $evidenceDir 't1-actual.txt'
@@ -447,6 +477,64 @@ try {
         $a5 = Wait-SnapSettled $snap5 8
         Assert-True (Test-Equal $t5 $a5) 'T5-no-modifier-residue' "got '$a5' (a stuck Shift would give 'CLEAN')"
     } finally { if ($t5w) { Stop-Target $t5w } }
+
+    # ---------------------------------------------------------------------
+    # T6: pressing stop repeatedly must not deadlock, crash, or wedge the app,
+    # and the next run must still work. A stop that arrives after the worker
+    # already finished is a no-op, not an error.
+    # ---------------------------------------------------------------------
+    Log '--- T6: repeated stop (double press) is safe and the app stays usable ---'
+    $snap6 = Join-Path $evidenceDir 't6-actual.txt'
+    $t6w = $null
+    try {
+        $t6w = Start-Target 'HID Target T6' $snap6
+        Assert-True (Force-Fg $t6w.Hwnd) 'T6-foreground' "hwnd=0x$($t6w.Hwnd.ToString('X'))"
+        Set-WmText ([HNative]::GetDlgItem($typer, $IDC_EDIT_TEXT)) ('abcdefghij' * 20)
+        Set-WmText ([HNative]::GetDlgItem($typer, $IDC_EDIT_INTERVAL)) '60'
+        Send-Cmd $typer $IDC_BTN_START
+        $started6 = Wait-Status $typer '输入中' 12
+        Assert-True ($started6 -match '输入中') 'T6-run-started' 'typing loop active before the double stop'
+        Start-Sleep -Milliseconds 1200
+        # First stop
+        [HNative]::keybd_event(0x11, 0, 0, [UIntPtr]::Zero)
+        [HNative]::keybd_event(0x12, 0, 0, [UIntPtr]::Zero)
+        [HNative]::keybd_event(0x58, 0, 0, [UIntPtr]::Zero)
+        Start-Sleep -Milliseconds 60
+        [HNative]::keybd_event(0x58, 0, 2, [UIntPtr]::Zero)
+        [HNative]::keybd_event(0x12, 0, 2, [UIntPtr]::Zero)
+        [HNative]::keybd_event(0x11, 0, 2, [UIntPtr]::Zero)
+        # Second stop immediately after, while the first is still settling
+        Start-Sleep -Milliseconds 40
+        [HNative]::keybd_event(0x11, 0, 0, [UIntPtr]::Zero)
+        [HNative]::keybd_event(0x12, 0, 0, [UIntPtr]::Zero)
+        [HNative]::keybd_event(0x58, 0, 0, [UIntPtr]::Zero)
+        Start-Sleep -Milliseconds 60
+        [HNative]::keybd_event(0x58, 0, 2, [UIntPtr]::Zero)
+        [HNative]::keybd_event(0x12, 0, 2, [UIntPtr]::Zero)
+        [HNative]::keybd_event(0x11, 0, 2, [UIntPtr]::Zero)
+
+        $st6 = Wait-Status $typer '(已停止【|完成【|错误|当前没有)' 20
+        Log "  status after double stop: $st6"
+        Assert-True ($st6 -match '(已停止【|完成【|当前没有)') 'T6-no-crash-status' "status=$st6"
+        Assert-True (-not $script:TyperProc.HasExited) 'T6-process-alive' 'typer process still running'
+        Assert-True ([HNative]::IsWindow($typer)) 'T6-window-alive' 'main window still exists (no deadlock)'
+        $a6 = Wait-SnapSettled $snap6 6
+        Assert-True ($a6.Length -lt 200) 'T6-output-bounded' "typed $($a6.Length) of 200 chars"
+        Assert-True (('abcdefghij' * 20).StartsWith(($a6 -replace $CRLF, '' -replace $LF, ''))) 'T6-prefix-consistent' 'output is a clean prefix'
+        Start-Sleep -Milliseconds 1000
+        $a6b = Wait-SnapSettled $snap6 6
+        Assert-True (Test-Equal $a6 $a6b) 'T6-stable-after-stop' "stable: '$($a6b.Substring(0, [Math]::Min(20, $a6b.Length)))...'"
+
+        # The app must still be able to run a normal task afterwards.
+        $t6w2 = Start-Target 'HID Target T6b' (Join-Path $evidenceDir 't6b-actual.txt')
+        try {
+            Assert-True (Force-Fg $t6w2.Hwnd) 'T6b-foreground' "hwnd=0x$($t6w2.Hwnd.ToString('X'))"
+            Set-WmText ([HNative]::GetDlgItem($typer, $IDC_EDIT_TEXT)) 'after-stop-ok'
+            Send-Cmd $typer $IDC_BTN_START
+            $st6b = Wait-Status $typer '(完成【|错误)' 25
+            Assert-True ($st6b -match '完成【TextDeck HID 模式】') 'T6b-run-after-stop' "status=$st6b"
+        } finally { if ($t6w2) { Stop-Target $t6w2 } }
+    } finally { if ($t6w) { Stop-Target $t6w } }
 }
 catch {
     Log "FATAL: $($_.Exception.Message)"

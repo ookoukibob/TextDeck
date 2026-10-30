@@ -173,7 +173,27 @@ struct Parser {
 } // namespace
 
 JsonPtr ParseJson(const std::string& text, std::string* err) {
-    Parser p(text);
+    // A UTF-8 BOM is not part of the JSON grammar, but it is what Windows
+    // PowerShell produces for `map_app.exe example > my.json` and
+    // `Out-File -Encoding UTF8`. Rejecting those files left the reader facing
+    // "unexpected char '∩' @ 0", which says nothing useful to the user, so the
+    // BOM is skipped here (once, centrally) for every ParseJson caller.
+    size_t begin = 0;
+    if (text.size() >= 3 &&
+        (unsigned char)text[0] == 0xEF &&
+        (unsigned char)text[1] == 0xBB &&
+        (unsigned char)text[2] == 0xBF) {
+        begin = 3;
+    }
+    // Parser keeps a reference to its input, so the BOM-stripped copy must
+    // outlive it (passing a temporary substr() here dangles).
+    std::string body;
+    const std::string* src = &text;
+    if (begin != 0) {
+        body.assign(text, begin, std::string::npos);
+        src = &body;
+    }
+    Parser p(*src);
     JsonPtr v = p.parse();
     if (!v && err) *err = p.err;
     return v;
