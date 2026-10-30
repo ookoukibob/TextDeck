@@ -10,6 +10,10 @@ contains **TextDeck Mapping**, a general-purpose input-mapping and key-script
 engine that turns input events (keyboard, mouse, gamepad, serial, UDP) into
 keyboard actions through the same output backends.
 
+**中文用户文档**（与发布 ZIP 内一致）：[功能说明](docs/功能说明.md) ·
+[安装说明](docs/安装说明.md) · [使用说明](docs/使用说明.md)。
+安装包下载见 [Releases](https://github.com/ookoukibob/TextDeck/releases)。
+
 ---
 
 ## Three typing backends
