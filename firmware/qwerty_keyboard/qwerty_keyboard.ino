@@ -64,6 +64,9 @@ static const uint16_t C_BORDER   = 0x18E3;
 static const uint16_t HID_HOLD_MS = 22;
 static const uint16_t HID_GAP_MS  = 18;
 
+// 组合键发送：usage 是普通键，shift/ctrl 是修饰。
+// emit* 系列只负责"怎么发"，不去改 g_ctrl ——
+// 是否消费 CTRL 由 handleKey 依据"是否真的产生了 HID 输出"统一决定。
 static void emitKeyRaw(uint8_t usage, bool shift, bool ctrl) {
   if (usage == 0) return;
 
@@ -248,9 +251,23 @@ static void drawAll() {
 }
 
 // ---------------- 按键处理 ----------------
+//
+// 两类按键要区分清楚：
+//
+//   A. 产生 HID 输出的键（字符、ENTER、TAB、SPACE、ESC、DEL、方向键）
+//      → 输出后消费一次性 SHIFT 和一次性 CTRL
+//
+//   B. 只改 UI 状态的键（SHIFT / CAPS / CTRL / SYM）
+//      → 不动修饰键状态（除自身切换）
+//
+// 早先只在 emitChar() 里清 g_ctrl，导致 CTRL+TAB、CTRL+方向键
+// 这类走 emitUsage() 的组合键打完之后 CTRL 还亮着，下一次普通输入
+// 会意外变成组合键。现在统一在 handleKey 收尾处消费。
 
 static void handleKey(int row, int col) {
   const keymap::KeyDef &k = kb::keyAt(row, col);
+
+  bool consumedCtrl = false;   // 本次按键是否用掉了 CTRL
 
   switch (k.kind) {
     case keymap::K_CHAR: {
@@ -268,9 +285,9 @@ static void handleKey(int row, int col) {
       }
       input.append(ch);
 
+      consumedCtrl = g_ctrl;
       if (g_shift) g_shift = false;      // Shift 一次性
-      if (g_ctrl)  g_ctrl  = false;      // Ctrl 一次性，避免后续输入全被组合
-      return;
+      break;
     }
 
     case keymap::K_SHIFT:    g_shift = !g_shift; return;
@@ -282,35 +299,51 @@ static void handleKey(int row, int col) {
       emitUsage(keymap::U_BACKSPACE);
       input.backspace();
       if (g_shift) g_shift = false;
-      return;
+      consumedCtrl = g_ctrl;
+      break;
 
     case keymap::K_ENTER:
       emitUsage(keymap::U_ENTER);
       input.newline();
-      return;
+      consumedCtrl = g_ctrl;
+      break;
 
     case keymap::K_TAB:
       emitUsage(keymap::U_TAB);
       input.append('\t');
-      return;
+      consumedCtrl = g_ctrl;
+      break;
 
     case keymap::K_SPACE:
       emitUsage(keymap::U_SPACE);
       input.append(' ');
-      return;
+      consumedCtrl = g_ctrl;
+      break;
 
     case keymap::K_ESC:
       emitUsage(keymap::U_ESC);
-      return;
+      consumedCtrl = g_ctrl;
+      break;
 
-    case keymap::K_UP:    emitUsage(keymap::U_UP);    return;
-    case keymap::K_DOWN:  emitUsage(keymap::U_DOWN);  return;
-    case keymap::K_LEFT:  emitUsage(keymap::U_LEFT);  return;
-    case keymap::K_RIGHT: emitUsage(keymap::U_RIGHT); return;
-    case keymap::K_DELETE: emitUsage(keymap::U_DELETE); return;
+    case keymap::K_UP:
+      emitUsage(keymap::U_UP);    consumedCtrl = g_ctrl; break;
+    case keymap::K_DOWN:
+      emitUsage(keymap::U_DOWN);  consumedCtrl = g_ctrl; break;
+    case keymap::K_LEFT:
+      emitUsage(keymap::U_LEFT);  consumedCtrl = g_ctrl; break;
+    case keymap::K_RIGHT:
+      emitUsage(keymap::U_RIGHT); consumedCtrl = g_ctrl; break;
+    case keymap::K_DELETE:
+      emitUsage(keymap::U_DELETE); consumedCtrl = g_ctrl; break;
 
     default:
       return;
+  }
+
+  // 组合键用完即复位，避免下一次输入被意外组合。
+  // SHIFT 已在各自分支消费；CAPS 是锁定状态，不在这里动。
+  if (consumedCtrl) {
+    g_ctrl = false;
   }
 }
 
@@ -376,10 +409,14 @@ void loop() {
     drawKeyboard();
   }
 
-  // 等松手，避免一次触摸触发多次
-  uint32_t t0 = millis();
-  while (tp.Is_Pressed() && (millis() - t0) < 700) {
-    delay(8);
+  // 等松手，避免一次触摸触发多次。
+  // 不能用固定时长上限（早先是 700ms），否则长按超时后手指仍按着，
+  // loop() 会立刻重新识别同一个键，表现为长按自动连发。
+  if (tp.Is_Pressed()) {
+    delay(30);                       // 吃掉接触抖动
+    while (tp.Is_Pressed()) {
+      delay(8);
+    }
   }
   delay(25);
 }

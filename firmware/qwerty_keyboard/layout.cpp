@@ -90,41 +90,57 @@ Rect keyRect(int row, int col) {
 
   const RowDef &rd = ROWS[row];
 
-  if (row == 0 || row == 1) {
-    // 10 键等宽，左右各留 KEY_GAP
-    int w = (SCREEN_W - KEY_GAP * (10 + 1)) / 10;    // (320-22)/10 = 29
-    r.x = (int16_t)(KEY_GAP + col * (w + KEY_GAP));
+  if (row == 0 || row == 1 || row == 2) {
+    // 等宽 10 键（行 2 左侧有缩进）。
+    // 用"前缀比例"分配宽度，把整数除法的余数摊到前几键上，
+    // 末键右缘精确落在 SCREEN_W - KEY_GAP，不会像原先那样右侧留白。
+    int indent = rd.indent;
+    int n = 10;
+    int usable = SCREEN_W - indent - KEY_GAP * (n + 1);
+
+    int x = indent + KEY_GAP;
+    for (int i = 0; i < col; i++) {
+      int w = ((i + 1) * usable) / n - (i * usable) / n;
+      x += w + KEY_GAP;
+    }
+    int w = ((col + 1) * usable) / n - (col * usable) / n;
+
+    r.x = (int16_t)x;
     r.w = (int16_t)w;
     return r;
   }
 
-  if (row == 2) {
-    // 有缩进，10 键
-    int avail = SCREEN_W - rd.indent - KEY_GAP * 11;
-    int w = avail / 10;
-    r.x = (int16_t)(rd.indent + KEY_GAP + col * (w + KEY_GAP));
-    r.w = (int16_t)w;
-    return r;
-  }
-
-  // 行 3/4/5：按权重填满
+  // 行 3/4/5：按权重填满整行。
+  //
+  // 关键：间距只跟【按键个数 n】有关，跟【权重之和 total】无关。
+  // 早先用 KEY_GAP * (total + 1) 会多扣间距，导致整行变窄、右侧留白。
+  //
+  // 为了不丢整数除法的余数，用"前缀权重比例"算每个键的宽度：
+  //   width(i) = floor(prefix[i+1] * usable / total) - floor(prefix[i] * usable / total)
+  // 这样所有键宽之和严格等于 usable，末键右缘精确落在 SCREEN_W - KEY_GAP。
   const int8_t *wt = (row == 3) ? W3 : (row == 4) ? W4 : W5;
   int n = rd.count;
   int total = 0;
   for (int i = 0; i < n; i++) total += wt[i];
 
-  int usable = SCREEN_W - KEY_GAP * (total + 1);
-  int unit = usable / total;
+  // usable 是"所有按键宽度之和"，间距单独加在键与键之间
+  int usable = SCREEN_W - KEY_GAP * (n + 1);
 
+  // 前缀权重和：prefix[i] = wt[0..i-1] 之和，prefix[0] = 0
+  int prefix[12];
+  prefix[0] = 0;
+  for (int i = 0; i < n; i++) prefix[i + 1] = prefix[i] + wt[i];
+
+  // 计算本键左侧的累计位置（前面所有键 + 它们之间的间距）
   int x = KEY_GAP;
-  for (int i = 0; i < col; i++) x += unit * wt[i] + KEY_GAP;
+  for (int i = 0; i < col; i++) {
+    int w = (prefix[i + 1] * usable) / total - (prefix[i] * usable) / total;
+    x += w + KEY_GAP;
+  }
+
+  int w = (prefix[col + 1] * usable) / total - (prefix[col] * usable) / total;
 
   r.x = (int16_t)x;
-  int w = unit * wt[col];
-  // 最后一键贴右边缘，避免累计误差留下缝隙
-  if (col == n - 1) {
-    w = SCREEN_W - KEY_GAP - x;
-  }
   r.w = (int16_t)w;
   return r;
 }

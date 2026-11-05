@@ -42,7 +42,8 @@ static bool g_hidReady = false;
 static int      g_t9LastKey = -1;     // 上次按的数字键 index
 static int      g_t9Cycle   = 0;      // 当前循环到的字母序号
 static uint32_t g_t9Deadline = 0;     // 连击有效期
-static char     g_t9PendingChar = 0;  // 尚未提交的字母
+static char     g_t9PendingChar = 0;  // 尚未确认的字母（已发出，仅用于候选替换）
+static bool     g_t9Upper = false;    // 本候选的大小写（创建时锁定，循环期间不变）
 
 // 视觉反馈
 static int g_pressIdx = -1;
@@ -170,13 +171,15 @@ static void drawCandidates() {
     return;
   }
 
-  // 显示该键所有字母，当前循环位置高亮
+  // 显示该键所有字母，当前循环位置高亮。
+  // 大小写必须跟当前候选已锁定的一致（g_t9Upper），
+  // 不能用 g_shift != g_caps —— 一次性 SHIFT 可能已经消费掉了。
   int x = 5;
   for (int k = 0; k < dk.letterCount; k++) {
-    char up = dk.letters[k];
-    if (g_shift != g_caps) up = (char)(up - 32);   // 大写显示
+    char ch = dk.letters[k];
+    if (g_t9Upper) ch = (char)(ch - 32);
 
-    char one[2] = { up, 0 };
+    char one[2] = { ch, 0 };
     uint16_t fg = (k == g_t9Cycle) ? 0x0000 : C_TEXT;
     uint16_t bg = (k == g_t9Cycle) ? C_ACCENT : C_CAND;
     if (k == g_t9Cycle) {
@@ -296,10 +299,6 @@ static void drawAll() {
 static const uint16_t HID_HOLD_MS = 22;
 static const uint16_t HID_GAP_MS  = 18;
 
-static void hidReleaseAll() {
-  Keyboard.releaseAll();
-}
-
 // 发一个键（可带修饰键），这是整个固件唯一的 HID 出口
 static void emitKeyRaw(uint8_t usage, bool shift, bool ctrl, bool alt) {
   if (usage == 0) return;
@@ -339,23 +338,30 @@ static void emitUsage(uint8_t usage) {
 
 // ---------------- 九键逻辑 ----------------
 
-// 把待提交的字母真正发出去
+// 确认当前候选：只清理候选状态，【不重新发送字符】。
+//
+// 候选字符在创建那一刻就已经通过 HID 发出、并且写进 input 缓冲了。
+// 早先这里还调用了 emitChar()/input.append()，导致切到下一个数字键时
+// 上一个字母被重复发送（按 2 再按 3 得到 "aad" 而不是 "ad"）。
+//
+// 一次性 SHIFT 不在这里处理：是否消费取决于是哪条路径触发的确认。
+//   - 切换数字键：由 pressDigit 先锁定新候选的大小写，再清 SHIFT
+//   - 超时确认：字符已定型，SHIFT 也随之失效（由 loop 清理）
+//   - SPACE / ENTER / 修饰键：由各自分支按语义处理
+// CAPS 是锁定状态，任何路径都不清除。
 static void commitPending() {
   if (g_t9PendingChar == 0) return;
-  char c = g_t9PendingChar;
+
   g_t9PendingChar = 0;
   g_t9LastKey = -1;
   g_t9Cycle = 0;
-
-  emitChar(c);
-  input.append(c);
 }
 
 // 按数字键
 static void pressDigit(int index) {
   const t9::DigitKey &dk = t9::DIGITS[index];
 
-  // 没字母的键（1 * # 0）：先提交待定，再直接输出
+  // 没字母的键（1 * # 0）：先确认上一个候选，再直接输出本键字符
   if (dk.letterCount == 0) {
     commitPending();
 
@@ -366,6 +372,10 @@ static void pressDigit(int index) {
       case '#': emitChar('#'); input.append('#'); break;
       default: break;
     }
+
+    // 这些键不参与 T9 候选循环，属于独立字符输入，
+    // 因此一次性 SHIFT 在这里就地消费。
+    if (g_shift) g_shift = false;
     return;
   }
 
@@ -373,17 +383,18 @@ static void pressDigit(int index) {
 
   // 同一个键且在有效期内 -> 循环下一个字母
   if (index == g_t9LastKey && (int32_t)(now - g_t9Deadline) < 0) {
-    // 已经发出去的字符要"改写"：用退格删掉再重发
+    // 已发出的字符要"改写"：退格删掉再重发。
+    // 这是正常的候选替换机制，不能去掉。
     g_t9Cycle = (g_t9Cycle + 1) % dk.letterCount;
 
-    // 从输入缓冲删掉上一个字符
-    // 注意：HID 侧用退格删除
     emitUsage(keymap::U_BACKSPACE);
     input.backspace();
 
-    char upper = false;
+    // 关键：循环期间大小写必须跟"候选创建时"一致。
+    // 如果这里重新算 g_shift != g_caps，而 SHIFT 在首次按键时已被消费，
+    // 就会出现 SHIFT+2 连击得到 "aBc" 这种抖动。
     char c = dk.letters[g_t9Cycle];
-    char out = ((g_shift != g_caps)) ? (char)(c - 32) : c;
+    char out = g_t9Upper ? (char)(c - 32) : c;
 
     emitChar(out);
     input.append(out);
@@ -393,19 +404,32 @@ static void pressDigit(int index) {
     return;
   }
 
-  // 不同键 -> 提交上一个，开始新的循环
+  // 不同键 -> 确认上一个候选，开始新的循环。
+  //
+  // 顺序很重要：先按"当前"修饰状态锁定新候选的大小写，
+  // 再让 commitPending() 去消费上一个候选留下的一次性 SHIFT。
+  // 否则 SHIFT+2（出 A）之后马上按 3，SHIFT 已被消费，
+  // 新候选会意外变成小写。
+  bool wantUpper = (g_shift != g_caps);
+
   commitPending();
 
   g_t9LastKey = index;
   g_t9Cycle = 0;
   g_t9Deadline = now + T9_TIMEOUT_MS;
 
+  // 候选创建时锁定大小写，之后同键循环沿用这个值，不再重新读 g_shift。
+  g_t9Upper = wantUpper;
+
   char c = dk.letters[0];
-  char out = ((g_shift != g_caps)) ? (char)(c - 32) : c;
+  char out = g_t9Upper ? (char)(c - 32) : c;
 
   emitChar(out);
   input.append(out);
   g_t9PendingChar = out;
+
+  // 候选已带着 SHIFT 的意图创建，SHIFT 到此消费掉
+  if (g_shift) g_shift = false;
 }
 
 // 按功能键
@@ -414,42 +438,56 @@ static void pressFunc(int index) {
 
   switch (fk.kind) {
     case t9::F_SHIFT:
+      // 先确认候选（只清候选状态），再切换 SHIFT。
+      // 反过来的话，"有候选时按 SHIFT"会先把 SHIFT 点亮又被 commit 的逻辑打乱。
       commitPending();
       g_shift = !g_shift;
+      drawStatusBar();
       return;
 
     case t9::F_CAPS:
+      // CAPS 与候选确认无关：它是锁定状态，不清 SHIFT 也不被清。
       commitPending();
       g_caps = !g_caps;
+      drawStatusBar();
       return;
 
     case t9::F_BACKSPACE:
-      // 有待定字母时先取消它
+      // 有待定字母时：删掉它并结束候选（不重复删）
       if (g_t9PendingChar != 0) {
         emitUsage(keymap::U_BACKSPACE);
         input.backspace();
         g_t9PendingChar = 0;
         g_t9LastKey = -1;
         g_t9Cycle = 0;
+        // 候选被删除后，一次性 SHIFT 也一并清掉，
+        // 避免下一个字符意外继承大写。
+        if (g_shift) g_shift = false;
         return;
       }
       emitUsage(keymap::U_BACKSPACE);
       input.backspace();
+      if (g_shift) g_shift = false;
       return;
 
     case t9::F_SPACE:
+      // 空格是独立字符：确认候选后，一次性 SHIFT 随之失效
       commitPending();
       emitChar(' ');
       input.append(' ');
+      if (g_shift) g_shift = false;
       return;
 
     case t9::F_ENTER:
       commitPending();
       emitUsage(keymap::U_ENTER);
       input.newline();
+      // 换行是独立事件，一次性 SHIFT 到此失效
+      if (g_shift) g_shift = false;
       return;
 
     case t9::F_LAYER:
+      // 只切 UI 层，不产生字符，不影响 SHIFT/CAPS
       commitPending();
       g_symbolLayer = !g_symbolLayer;
       return;
@@ -487,13 +525,13 @@ void setup() {
 void loop() {
   uint32_t now = millis();
 
-  // ---- 1. 九键连击超时 -> 提交 ----
+  // ---- 1. 九键连击超时 -> 候选确认 ----
+  // 字符早已发出，这里只做状态确认：清候选、消费一次性 SHIFT。
   if (g_t9PendingChar != 0 && (int32_t)(now - g_t9Deadline) >= 0) {
-    // 超时后只是清除待定状态（字符已经发出去了，不需要重发）
-    g_t9PendingChar = 0;
-    g_t9LastKey = -1;
-    g_t9Cycle = 0;
+    commitPending();
+    if (g_shift) g_shift = false;   // 该字母已定型，SHIFT 到此为止
     drawCandidates();
+    drawStatusBar();
   }
 
   // ---- 2. 按键高亮复位 ----
@@ -548,10 +586,20 @@ void loop() {
     for (int i = 0; i < t9::FUNC_COUNT; i++) drawFunc(i, false);
   }
 
-  // 等松手，避免一次触摸触发多次
-  uint32_t t0 = millis();
-  while (tp.Is_Pressed() && (millis() - t0) < 700) {
-    delay(8);
+  // 等松手，避免一次触摸触发多次。
+  //
+  // 注意：这里不能只等固定时长。早先写成
+  //     while (tp.Is_Pressed() && (millis() - t0) < 700)
+  // 长按超过 700ms 时循环退出，但手指仍按着，loop() 立刻重新读出同一个键，
+  // 于是同一次接触被当成新的按键事件（表现为长按自动连发）。
+  //
+  // 改成"锁存到真正松手"：先等一个短暂停顿避免抖动误判，
+  // 之后只要 IRQ 仍为低就继续等待，不设上限。
+  if (tp.Is_Pressed()) {
+    delay(30);                       // 吃掉接触抖动
+    while (tp.Is_Pressed()) {
+      delay(8);
+    }
   }
   delay(25);
 }
