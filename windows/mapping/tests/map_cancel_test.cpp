@@ -1507,18 +1507,20 @@ int main() {
     }
 
     // ---- C25: the Stop publication window must be closed ---------------------
-    // GENUINE CONCURRENCY regression for:
-    //   T1 requestStop() allocates and publishes epoch N,
-    //   T2 cancelSource("padA") snapshots cancelEpoch_ == N, acquires
-    //      cancelTrackMu_, finds N absent from stopRequests_ (registration had not
-    //      happened yet), and acknowledges the global Stop as an ordinary cancel,
-    //   T1 then registers N as a Stop - too late.
+    // GENUINE CONCURRENCY regression for the publish-first defect:
+    //   T1 requestStop() published epoch N,
+    //   T2 cancelSource("padA") snapshotted cancelEpoch_ == N, took
+    //      cancelTrackMu_, found N absent from stopRequests_ (registration had not
+    //      happened yet) and acknowledged the global Stop as an ordinary cancel.
     //
-    // The engine's own setStopPublicationHook() fires INSIDE requestStop(), after
-    // the epoch is allocated and its Stop scope registered, but BEFORE the epoch is
-    // published, while cancelTrackMu_ is held. That is the precise instant the
-    // defect needs. A source cleanup driven from another thread at that instant
-    // must block on the same lock and, once it proceeds, must see the Stop scope.
+    // DETERMINISM AND LIFETIME:
+    //   * The rival thread object lives in this scope; it is NEVER detached and is
+    //     always joined, including on the timeout/failure path.
+    //   * The stop publisher holds cancelTrackMu_ for the whole window, so the
+    //     rival cannot complete its snapshot+acknowledge until publication is done.
+    //   * A handshake proves the rival actually ENTERED the cleanup path (its
+    //     pre-lock hook fired) instead of merely not having been scheduled. The
+    //     three observable states are tracked explicitly.
     section("C25 Stop publication and scope registration are atomic");
     {
         auto out = std::make_shared<HookBackend>();
@@ -1534,137 +1536,230 @@ int main() {
         e.dispatch(press("padB", "b", 1000));
         check(out->isHeld("space"), "c25-B-holds-space", "");
 
+        std::mutex                hsMu;
+        std::condition_variable   hsCv;
+
+        // State 1: rival not yet scheduled / not yet inside cleanup.
+        std::atomic<bool> rivalEnteredCleanup{false};   // pre-lock hook fired
+        // State 2: rival inside cleanup, blocked on cancelTrackMu_ (implicit).
+        // State 3: rival finished its source cleanup.
+        std::atomic<bool> rivalFinishedCleanup{false};
+
         std::atomic<uint64_t> publishedEpoch{0};
-        std::atomic<bool> cleanupStarted{false};
-        std::atomic<bool> cleanupFinished{false};
         std::atomic<bool> stopStillPendingAfterCleanup{false};
         std::atomic<bool> stopAckedAfterCleanup{false};
         std::atomic<bool> rivalFinishedInsideWindow{false};
+        std::atomic<bool> hookRan{false};
+
+        // Rival thread object lives here: joined unconditionally below.
+        std::thread rival;
+        std::atomic<bool> rivalStarted{false};
+
+        // Runs at the very top of cancelSource(), BEFORE it takes cancelTrackMu_.
+        // Signalling here is what distinguishes "entered the cleanup path" from
+        // "never scheduled".
+        e.setSourceCleanupPrelockHook([&](const std::string&) {
+            {
+                std::lock_guard<std::mutex> lk(hsMu);
+                rivalEnteredCleanup.store(true);
+            }
+            hsCv.notify_all();
+        });
 
         // Fires on the publishing thread while it holds cancelTrackMu_.
         e.setStopPublicationHook([&](uint64_t epochBeingPublished) {
+            hookRan.store(true);
             publishedEpoch.store(epochBeingPublished);
-            // Run the competing source cleanup on ANOTHER thread, i.e. exactly the
-            // interleaving under test. It must block on cancelTrackMu_, which this
-            // thread still holds, so it cannot complete inside this window.
-            std::thread rival([&] {
-                cleanupStarted.store(true);
-                e.cancelSource("padA");            // default-argument form
+
+            rival = std::thread([&] {
+                rivalStarted.store(true);
+                e.cancelSource("padA");                 // default-argument form
                 stopStillPendingAfterCleanup.store(e.stopPending());
                 stopAckedAfterCleanup.store(e.cancelAcknowledged(epochBeingPublished));
-                cleanupFinished.store(true);
+                rivalFinishedCleanup.store(true);
+                hsCv.notify_all();
             });
-            // Bounded observation only - no join() here, because the rival cannot
-            // finish while we hold the lock and joining would deadlock.
-            for (int i = 0; i < 40 && !cleanupFinished.load(); ++i) {
-                std::this_thread::sleep_for(std::chrono::milliseconds(1));
+
+            // Handshake with a bounded wait: do not leave this window until the
+            // rival has actually entered the cleanup path (its pre-lock hook ran).
+            // It still cannot complete, because we hold cancelTrackMu_.
+            {
+                std::unique_lock<std::mutex> lk(hsMu);
+                hsCv.wait_for(lk, std::chrono::seconds(10),
+                              [&] { return rivalEnteredCleanup.load(); });
             }
-            if (cleanupFinished.load()) rivalFinishedInsideWindow.store(true);
-            rival.detach();     // completes after this thread releases the lock
+            // Negative observation: since the rival is inside cleanup and we hold
+            // the lock, it must not have finished. Bounded, and never the sole
+            // basis of correctness - the decisive assertions come after the join.
+            if (rivalFinishedCleanup.load()) rivalFinishedInsideWindow.store(true);
         });
 
         const uint64_t stopEpoch = e.requestStop();
-        // The rival needs the lock we just released; wait (bounded) for it.
-        for (int i = 0; i < 2000 && !cleanupFinished.load(); ++i) {
-            std::this_thread::sleep_for(std::chrono::milliseconds(1));
+
+        // The rival now needs the lock we released; wait (bounded) for completion.
+        {
+            std::unique_lock<std::mutex> lk(hsMu);
+            hsCv.wait_for(lk, std::chrono::seconds(10),
+                          [&] { return rivalFinishedCleanup.load(); });
         }
-        check(cleanupStarted.load(), "c25-rival-cleanup-ran", "");
-        check(cleanupFinished.load(), "c25-rival-cleanup-completed", "");
-        // It provably could not complete inside the publication window: that is the
-        // structural proof the lock closes the race.
+        const bool finished = rivalFinishedCleanup.load();
+
+        // ALWAYS join, whatever happened, so no thread can outlive this scope.
+        if (rival.joinable()) rival.join();
+
+        // Clear the hooks before any further engine use, so production-path
+        // behaviour is restored for the rest of the test.
+        e.setStopPublicationHook(nullptr);
+        e.setSourceCleanupPrelockHook(nullptr);
+
+        check(hookRan.load(), "c25-publication-hook-ran", "");
+        check(rivalStarted.load(), "c25-rival-started", "");
+        check(rivalEnteredCleanup.load(), "c25-rival-entered-cleanup-path", "");
+        check(finished, "c25-rival-cleanup-completed", "");
+        // It provably could not finish inside the window: structural proof the lock
+        // closes the race, not a timing coincidence.
         check(!rivalFinishedInsideWindow.load(),
               "c25-rival-cannot-finish-inside-window", "");
         check(stopEpoch == publishedEpoch.load(), "c25-hook-saw-same-epoch",
               "stop=" + std::to_string(stopEpoch) +
               " hook=" + std::to_string(publishedEpoch.load()));
 
-        // The decisive assertions: the source cleanup observed the Stop as pending
-        // and did NOT acknowledge it, even though it ran inside the publication
-        // window.
+        // Decisive: after the rival's cleanup ran, the Stop is still pending and was
+        // not acknowledged by the source-scoped cleanup.
         check(stopStillPendingAfterCleanup.load(),
               "c25-stop-pending-after-rival-cleanup", "");
         check(!stopAckedAfterCleanup.load(),
               "c25-stop-not-acked-by-source-cleanup", "");
-
-        // And it is still pending now, with B's key untouched.
         check(e.stopPending(), "c25-stop-pending-now", "");
         check(!e.cancelAcknowledged(stopEpoch), "c25-stop-not-acked-now", "");
         check(out->isHeld("space"), "c25-B-key-still-held", "");
 
         // Global cleanup releases B's key and only then acknowledges the Stop.
-        e.setStopPublicationHook(nullptr);
         e.cancelAll();
         check(!e.stopPending(), "c25-stop-acked-by-global-cleanup", "");
         check(!out->isHeld("space"), "c25-global-cleanup-released-space", "");
         check(!e.cancelPending(), "c25-nothing-pending", "");
     }
 
-    // ---- C25b: many concurrent stops against concurrent source cleanups ------
-    // Bounded stress: N stops published from one thread while another hammers the
-    // default-argument source cleanup. No published Stop may ever be acknowledged
-    // by a source cleanup; only the global cleanup resolves them.
-    section("C25b concurrent stops vs concurrent source cleanups");
+    // ---- C25b: interleaved stops and source cleanups -------------------------
+    // The previous version started both threads and hoped they overlapped: the
+    // publisher could finish all stops before the cleanup ran even once, and stop
+    // epochs were only recorded AFTER requestStop() returned, so a cleanup could
+    // (wrongly) acknowledge a Stop that was absent from the recorded list.
+    //
+    // This version forces the overlap in ROUNDS and counts what actually happened:
+    //   * The stop publication hook records each epoch while it is being published
+    //     (inside requestStop(), before publication), so the recorded set is never
+    //     behind an epoch a cleanup could act on. The hook only appends under a
+    //     test mutex; it never calls back into the Engine.
+    //   * Each round publishes kPerRound stops, then performs a source cleanup
+    //     while those stops are outstanding, then verifies that none of the
+    //     recorded Stopped epochs was acknowledged.
+    //   * Execution counters prove real coverage instead of assuming it.
+    section("C25b interleaved stop publication and source cleanup");
     {
         auto out = std::make_shared<HookBackend>();
         Engine e(out);
         Binding holdB; holdB.id = "c25bB"; holdB.match = {"padB", "b", EventType::Pressed};
         holdB.trigger = TriggerKind::Momentary; holdB.holdKey = "space";
+        Binding actA; actA.id = "c25bA"; actA.match = {"padA", "x", EventType::Pressed};
+        Action ta; ta.kind = ActionKind::KeyTap; ta.key = "k"; actA.script = {ta};
         e.addBinding(holdB);
+        e.addBinding(actA);
         e.dispatch(press("padB", "b", 1000));
         check(out->isHeld("space"), "c25b-B-holds", "");
 
-        const int kStops = 200;
+        const int kRounds    = 20;
+        const int kPerRound  = 10;
+
         std::mutex epMu;
-        std::vector<uint64_t> stops;
-        std::atomic<bool> publishDone{false};
+        std::vector<uint64_t> stoppedEpochs;    // recorded during publication
+        std::atomic<int> cleanupRuns{0};
+        std::atomic<int> publishRuns{0};
         std::atomic<bool> anyStopAckedBySource{false};
+        std::atomic<int>  sourceSawOutstandingStops{0};
 
-        // Synchronised start so both threads contend immediately.
-        std::atomic<int> ready{0};
-        auto waitAll = [&] { ready.fetch_add(1); while (ready.load() < 2) std::this_thread::yield(); };
+        // Records the epoch inside requestStop(), before it becomes visible.
+        e.setStopPublicationHook([&](uint64_t epochBeingPublished) {
+            std::lock_guard<std::mutex> lk(epMu);
+            stoppedEpochs.push_back(epochBeingPublished);
+        });
 
+        for (int round = 0; round < kRounds; ++round) {
+            // 1. Publish a batch; the hook records each epoch as it is published.
+            for (int i = 0; i < kPerRound; ++i) {
+                e.requestStop();
+                publishRuns.fetch_add(1);
+            }
+
+            // 2. Run a source cleanup WHILE those stops are outstanding. This is a
+            //    real overlap, enforced by program order, not by thread racing.
+            e.cancelSource("padA");
+            cleanupRuns.fetch_add(1);
+
+            // 3. Every recorded Stop epoch must still be unacknowledged.
+            std::vector<uint64_t> snapshot;
+            { std::lock_guard<std::mutex> lk(epMu); snapshot = stoppedEpochs; }
+            for (uint64_t ep : snapshot) {
+                if (e.cancelAcknowledged(ep)) anyStopAckedBySource.store(true);
+                else if (e.stopPending()) sourceSawOutstandingStops.fetch_add(1);
+            }
+        }
+
+        // Additionally: a concurrent pass where a SECOND thread keeps publishing
+        // while the main thread cleans up, so the locking protocol is exercised
+        // under genuine concurrency rather than only program order.
+        std::atomic<bool> publisherDone{false};
         std::thread publisher([&] {
-            waitAll();
-            for (int i = 0; i < kStops; ++i) {
-                const uint64_t ep = e.requestStop();
-                { std::lock_guard<std::mutex> lk(epMu); stops.push_back(ep); }
+            for (int i = 0; i < kRounds * kPerRound; ++i) {
+                e.requestStop();
+                publishRuns.fetch_add(1);
             }
-            publishDone.store(true);
+            publisherDone.store(true);
         });
-        std::thread cleanup([&] {
-            waitAll();
-            while (!publishDone.load()) {
-                // Default-argument form: snapshots the newest published epoch.
-                e.cancelSource("padA");
-                // A Stop can only be acknowledged by the global cleanup, which has
-                // not run yet. This is the decisive property; sampling whether a
-                // stop happens to look pending at this instant is timing-dependent
-                // (an epoch may not be published yet), so it is not asserted here.
-                std::vector<uint64_t> snapshot;
-                { std::lock_guard<std::mutex> lk(epMu); snapshot = stops; }
-                for (uint64_t ep : snapshot) {
-                    if (e.cancelAcknowledged(ep)) {
-                        anyStopAckedBySource.store(true);
-                    }
-                }
+        int concurrentCleanups = 0;
+        while (!publisherDone.load() || concurrentCleanups < kRounds) {
+            e.cancelSource("padA");
+            ++concurrentCleanups;
+            cleanupRuns.fetch_add(1);
+            std::vector<uint64_t> snapshot;
+            { std::lock_guard<std::mutex> lk(epMu); snapshot = stoppedEpochs; }
+            for (uint64_t ep : snapshot) {
+                if (e.cancelAcknowledged(ep)) anyStopAckedBySource.store(true);
             }
-        });
+        }
         publisher.join();
-        cleanup.join();
 
-        check(stops.size() == (size_t)kStops, "c25b-all-stops-published",
-              "n=" + std::to_string(stops.size()));
+        e.setStopPublicationHook(nullptr);
+
+        std::vector<uint64_t> allStops;
+        { std::lock_guard<std::mutex> lk(epMu); allStops = stoppedEpochs; }
+
+        // Coverage assertions: the test must have actually exercised the paths.
+        check(publishRuns.load() >= 2 * kRounds * kPerRound,
+              "c25b-publisher-ran-enough", "n=" + std::to_string(publishRuns.load()));
+        check(cleanupRuns.load() >= kRounds + kRounds,
+              "c25b-cleanup-ran-enough", "n=" + std::to_string(cleanupRuns.load()));
+        check(!allStops.empty(), "c25b-stops-recorded",
+              "n=" + std::to_string(allStops.size()));
+        check(sourceSawOutstandingStops.load() > 0,
+              "c25b-source-saw-outstanding-stops",
+              "n=" + std::to_string(sourceSawOutstandingStops.load()));
+
+        // Decisive: no Stop was ever acknowledged by a source cleanup.
         check(!anyStopAckedBySource.load(), "c25b-no-stop-acked-by-source-cleanup", "");
         check(e.stopPending(), "c25b-stop-still-pending", "");
         check(out->isHeld("space"), "c25b-B-key-still-held", "");
 
+        // Global cleanup resolves everything and releases the key.
         e.cancelAll();
         check(!e.stopPending(), "c25b-global-cleanup-acks", "");
         check(!out->isHeld("space"), "c25b-global-cleanup-released", "");
-        for (uint64_t ep : stops) if (!e.cancelAcknowledged(ep)) {
-            check(false, "c25b-every-stop-acked-after-global", "ep=" + std::to_string(ep));
-            break;
-        }
+        int unacked = 0;
+        for (uint64_t ep : allStops) if (!e.cancelAcknowledged(ep)) ++unacked;
+        check(unacked == 0, "c25b-every-recorded-stop-acked-after-global",
+              "unacked=" + std::to_string(unacked) +
+              " total=" + std::to_string(allStops.size()));
         check(!e.cancelPending(), "c25b-nothing-pending", "");
     }
 

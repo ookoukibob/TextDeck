@@ -689,6 +689,12 @@ void Engine::cancelSource(const std::string& source, uint64_t requestEpoch) {
     // epoch) or after publication, when the scope is already registered. Reading
     // cancelEpoch_ without the lock could observe the new epoch while stopRequests_
     // still lacked it, and then acknowledge a global Stop as if it were ordinary.
+    // Read the test-only pre-lock observer ONCE, before taking the lock, so the
+    // production path performs no extra work and no callback can run while
+    // cancelTrackMu_ is held.
+    const std::function<void(const std::string&)> prelock = prelockHook_;
+    if (prelock) prelock(source);
+
     const uint64_t covered = [&] {
         std::lock_guard<std::mutex> lk(cancelTrackMu_);
         return requestEpoch ? requestEpoch

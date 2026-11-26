@@ -185,6 +185,15 @@ public:
     // uses it to run a concurrent source cleanup inside that window and prove it
     // cannot acknowledge the Stop. It must not call back into the engine.
     void setStopPublicationHook(std::function<void(uint64_t)> fn) { stopPublishHook_ = std::move(fn); }
+    // Test-only, empty in production. Invoked at the very TOP of cancelSource(),
+    // BEFORE it takes cancelTrackMu_. It lets a test prove that a competing cleanup
+    // has actually entered the cleanup path while the Stop publisher still holds
+    // the lock - i.e. distinguish "not yet scheduled" from "blocked on the lock".
+    // The callback runs WITHOUT cancelTrackMu_ held and must not call back into the
+    // engine; it exists only to signal the test thread.
+    void setSourceCleanupPrelockHook(std::function<void(const std::string&)> fn) {
+        prelockHook_ = std::move(fn);
+    }
     // True while an accepted request has not been acknowledged yet. Producers may
     // poll these (read-only); only cancelAll()/cancelSource() acknowledge.
     bool cancelPending() const;
@@ -327,6 +336,8 @@ private:
     // Test-only observation hook for the publication window. Never set in
     // production, so it does not affect the production path's semantics.
     std::function<void(uint64_t)> stopPublishHook_;
+    // Test-only pre-lock observer for cancelSource(). Empty in production.
+    std::function<void(const std::string&)> prelockHook_;
     size_t textFailures_ = 0;   // executor-thread only, like the rest of the state
 
     static std::string ctrlKey(const std::string& s, const std::string& c) { return s + "|" + c; }
