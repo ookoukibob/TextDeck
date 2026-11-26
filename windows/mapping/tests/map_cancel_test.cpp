@@ -57,32 +57,43 @@ static int count(const std::vector<std::string>& ops, const std::string& op) {
 static int taps(const std::vector<std::string>& ops, const std::string& key) {
     return count(ops, "down:" + key);
 }
-
 // ---------------------------------------------------------------------------
 // HookBackend: records operations like RecordOutput, but lets a test inject a
 // cancellation at an exact point in the input sequence. This is what makes the
 // concurrency tests deterministic: the hook runs synchronously on the thread
 // that is executing the script, at a defined boundary between input units.
+//
+// THREAD SAFETY: every accessor that a test thread may call while the runtime
+// executor is live takes mu_. `ops` and `held_` are plain containers, so reading
+// them from another thread without the lock would be a data race (undefined
+// behaviour) even if it happens to "work" in practice. Tests that assert on `ops`
+// should either synchronise through snapshot()/signal, or assert only after the
+// executor has been joined.
 // ---------------------------------------------------------------------------
 class HookBackend final : public OutputBackend {
 public:
-    std::vector<std::string> ops;
     std::function<void(const std::string& key)> onKeyDown;  // after the down
     std::function<void(int charsEmitted)>      onTextChar;  // after each char
     int failTypeTextAtChar = -1;                            // -1 = never fail
 
     bool keyDown(const std::string& key) override {
         if (!FindKey(key)) return false;
-        held_[key]++;
-        ops.push_back("down:" + key);
+        {
+            std::lock_guard<std::mutex> lk(mu_);
+            held_[key]++;
+            ops.push_back("down:" + key);
+        }
         if (onKeyDown) onKeyDown(key);
         return true;
     }
     bool keyUp(const std::string& key) override {
-        auto it = held_.find(key);
-        if (it == held_.end()) return false;
-        if (--it->second <= 0) held_.erase(it);
-        ops.push_back("up:" + key);
+        {
+            std::lock_guard<std::mutex> lk(mu_);
+            auto it = held_.find(key);
+            if (it == held_.end()) return false;
+            if (--it->second <= 0) held_.erase(it);
+            ops.push_back("up:" + key);
+        }
         return true;
     }
     TextOutcome typeText(const std::string& text, const CancelProbe& cancelled) override {
@@ -90,35 +101,63 @@ public:
         int emitted = 0;
         for (char c : text) {
             if (cancelled && cancelled()) {
-                if (!sent.empty()) ops.push_back("text:" + sent);
+                if (!sent.empty()) { std::lock_guard<std::mutex> lk(mu_); ops.push_back("text:" + sent); }
                 return TextOutcome::Cancelled;
             }
             if (emitted == failTypeTextAtChar) {
-                if (!sent.empty()) ops.push_back("text:" + sent);
+                if (!sent.empty()) { std::lock_guard<std::mutex> lk(mu_); ops.push_back("text:" + sent); }
                 return TextOutcome::Failed;
             }
             sent += c;
             ++emitted;
             if (onTextChar) onTextChar(emitted);
         }
-        if (!sent.empty()) ops.push_back("text:" + sent);
+        if (!sent.empty()) { std::lock_guard<std::mutex> lk(mu_); ops.push_back("text:" + sent); }
         return TextOutcome::Ok;
     }
     bool releaseAll() override {
+        std::lock_guard<std::mutex> lk(mu_);
         for (const auto& kv : held_) ops.push_back("up:" + kv.first);
         held_.clear();
         return true;
     }
     const char* name() const override { return "hook"; }
-    bool isHeld(const std::string& key) const { return held_.find(key) != held_.end(); }
+    bool isHeld(const std::string& key) const {
+        std::lock_guard<std::mutex> lk(mu_);
+        return held_.find(key) != held_.end();
+    }
     std::vector<std::string> heldKeys() const {
+        std::lock_guard<std::mutex> lk(mu_);
         std::vector<std::string> v;
         for (const auto& kv : held_) v.push_back(kv.first);
         return v;
     }
+    // Locked copy of the recorded operations. Use this from the test thread when
+    // the executor may still be running; never read `ops` directly in that case.
+    std::vector<std::string> snapshot() const {
+        std::lock_guard<std::mutex> lk(mu_);
+        return ops;
+    }
+    // Number of recorded ops equal to `op`, taken under the lock.
+    int countOp(const std::string& op) const {
+        std::lock_guard<std::mutex> lk(mu_);
+        int n = 0;
+        for (const auto& o : ops) if (o == op) ++n;
+        return n;
+    }
 private:
+    mutable std::mutex mu_;
     std::map<std::string, int> held_;
+    std::vector<std::string> ops;   // guarded by mu_ while the executor is live
 };
+
+// Locked accessors for HookBackend. Every assertion on recorded operations goes
+// through these, so the test thread never touches `ops` while the executor writes
+// it. Outside the runtime the behaviour is identical to the plain helpers above.
+static int countOf(const HookBackend& hb, const std::string& op) { return hb.countOp(op); }
+static int tapsOf(const HookBackend& hb, const std::string& key) {
+    return hb.countOp("down:" + key);
+}
 
 // ---------------------------------------------------------------------------
 // FailBackend: a controllable output backend that refuses selected operations.
@@ -192,14 +231,14 @@ int main() {
         check(ep >= 1, "c1-request-has-epoch", "epoch=" + std::to_string(ep));
 
         e.dispatch(press("s", "c", 1000));
-        check(taps(out->ops, "x") == 0, "c1-dispatch-blocked", "");
+        check(tapsOf(*out, "x") == 0, "c1-dispatch-blocked", "");
         check(e.cancelPending(), "c1-request-not-silently-cleared", "");
 
         // Completing the stop releases the block, and the next action runs.
         e.cancelAll(ep);
         check(!e.cancelPending(), "c1-ack-clears-request", "");
         e.dispatch(press("s", "c", 2000));
-        check(taps(out->ops, "x") == 1, "c1-action-runs-after-ack", "");
+        check(tapsOf(*out, "x") == 1, "c1-action-runs-after-ack", "");
         check(out->heldKeys().empty(), "c1-no-stuck-keys", "");
     }
 
@@ -236,8 +275,8 @@ int main() {
         const long ms = (long)std::chrono::duration_cast<std::chrono::milliseconds>(
             std::chrono::steady_clock::now() - t0).count();
 
-        check(taps(out->ops, "a") == 1, "c2-first-nested-step-ran", "");
-        check(taps(out->ops, "z") == 0, "c2-rest-of-block-skipped", "");
+        check(tapsOf(*out, "a") == 1, "c2-first-nested-step-ran", "");
+        check(tapsOf(*out, "z") == 0, "c2-rest-of-block-skipped", "");
         check(ms < 500, "c2-delay-did-not-run-to-completion",
               "elapsed=" + std::to_string(ms) + "ms of a 3000ms delay");
         check(e.cancelPending(), "c2-cancel-still-pending", "");
@@ -261,9 +300,9 @@ int main() {
             if (k == "a") e.requestCancel();
         };
         e.dispatch(press("s", "c", 1000));
-        check(taps(out->ops, "a") == 1, "c2b-repeat-stops-after-first-step",
-              "a=" + std::to_string(taps(out->ops, "a")));
-        check(taps(out->ops, "b") == 0, "c2b-no-second-step", "");
+        check(tapsOf(*out, "a") == 1, "c2b-repeat-stops-after-first-step",
+              "a=" + std::to_string(tapsOf(*out, "a")));
+        check(tapsOf(*out, "b") == 0, "c2b-no-second-step", "");
         e.cancelAll();
     }
 
@@ -285,12 +324,12 @@ int main() {
         e.dispatch(press("s", "c", 1000));
 
         bool sawPartial = false;
-        for (const auto& o : out->ops) if (o == "text:abc") sawPartial = true;
+        for (const auto& o : out->snapshot()) if (o == "text:abc") sawPartial = true;
         check(sawPartial, "c3-text-stopped-at-safe-point", "");
         bool sawWhole = false;
-        for (const auto& o : out->ops) if (o == "text:abcdefghij") sawWhole = true;
+        for (const auto& o : out->snapshot()) if (o == "text:abcdefghij") sawWhole = true;
         check(!sawWhole, "c3-text-did-not-complete", "");
-        check(taps(out->ops, "z") == 0, "c3-following-action-skipped", "");
+        check(tapsOf(*out, "z") == 0, "c3-following-action-skipped", "");
         check(e.cancelPending(), "c3-cancel-reported-pending", "");
         e.cancelAll();
         check(!e.cancelPending(), "c3-ack-clears-request", "");
@@ -358,18 +397,27 @@ int main() {
             if (!acked) std::this_thread::sleep_for(std::chrono::milliseconds(10));
         }
         check(acked, "c4-stop-acknowledged", "");
-        check(taps(out->ops, "z") == 0, "c4-no-action-after-stop", "");
+        check(tapsOf(*out, "z") == 0, "c4-no-action-after-stop", "");
         check(out->heldKeys().empty(), "c4-no-stuck-keys", "");
 
-        // The runtime must accept new work afterwards (guarantee 8).
+        // The runtime must accept new work afterwards (guarantee 8). A condition
+        // variable rather than polling shared output state.
+        std::mutex mu;
+        std::condition_variable cv;
+        bool yRan = false;
+        out->onKeyDown = [&](const std::string& key) {
+            if (key != "y") return;
+            { std::lock_guard<std::mutex> lk(mu); yRan = true; }
+            cv.notify_all();
+        };
         rt.post(press("s", "quick", 2));
-        bool ran = false;
-        for (int i = 0; i < 200 && !ran; ++i) {
-            ran = taps(out->ops, "y") == 1;
-            if (!ran) std::this_thread::sleep_for(std::chrono::milliseconds(10));
+        {
+            std::unique_lock<std::mutex> lk(mu);
+            cv.wait_for(lk, std::chrono::seconds(10), [&] { return yRan; });
         }
-        check(ran, "c4-new-action-after-stop", "");
         rt.stop();
+        check(yRan, "c4-new-action-after-stop", "");
+        check(tapsOf(*out, "y") == 1, "c4-exactly-one-action", "");
     }
 
     // ---- C5: pending actions follow CancelAll semantics ---------------------
@@ -393,12 +441,12 @@ int main() {
               "pending=" + std::to_string(rt.pending()));
         check(rt.eventsDroppedByCancel() >= 3, "c5-discard-counted",
               "dropped=" + std::to_string(rt.eventsDroppedByCancel()));
-        check(taps(out->ops, "k") == 0, "c5-none-of-them-ran", "");
+        check(tapsOf(*out, "k") == 0, "c5-none-of-them-ran", "");
 
         // A fresh action after the stop is processed normally.
         rt.post(press("s", "c", 4));
         check(rt.processOne(0), "c5-later-action-accepted", "");
-        check(taps(out->ops, "k") == 1, "c5-later-action-ran", "");
+        check(tapsOf(*out, "k") == 1, "c5-later-action-ran", "");
     }
 
     // ---- C5b: an event posted during the stop race is not dispatched -------
@@ -424,14 +472,14 @@ int main() {
               "dropped=" + std::to_string(dropped));
 
         check(!rt.processOne(0), "c5b-inflight-event-gone", "");
-        check(taps(out->ops, "k") == 0, "c5b-inflight-event-not-dispatched", "");
+        check(tapsOf(*out, "k") == 0, "c5b-inflight-event-not-dispatched", "");
         check(rt.eventsDroppedByCancel() >= 0, "c5b-drop-path-reachable", "");
 
         // An event posted after the barrier is on the other side of the
         // linearization point and must survive and run.
         rt.post(press("s", "c", 2));
         check(rt.processOne(0), "c5b-post-stop-event-accepted", "");
-        check(taps(out->ops, "k") == 1, "c5b-post-stop-event-ran", "");
+        check(tapsOf(*out, "k") == 1, "c5b-post-stop-event-ran", "");
     }
 
     // ---- C6: repeated / concurrent cancellation stays consistent ------------
@@ -446,14 +494,14 @@ int main() {
         e.requestStop(); e.requestStop(); e.requestStop();
         check(e.cancelPending(), "c6-repeated-requests-registered", "");
         e.dispatch(press("s", "c", 1000));
-        check(taps(out->ops, "x") == 0, "c6-still-blocked", "");
+        check(tapsOf(*out, "x") == 0, "c6-still-blocked", "");
 
         e.cancelAll();                       // one acknowledgement clears them all
         check(!e.cancelPending(), "c6-single-ack-clears-burst", "");
         e.cancelAll();                       // a second/replayed stop is harmless
         check(!e.cancelPending(), "c6-double-ack-stable", "");
         e.dispatch(press("s", "c", 2000));
-        check(taps(out->ops, "x") == 1, "c6-normal-execution-after-acks", "");
+        check(tapsOf(*out, "x") == 1, "c6-normal-execution-after-acks", "");
         check(out->heldKeys().empty(), "c6-no-stuck-keys", "");
     }
 
@@ -511,7 +559,7 @@ int main() {
 
         // pad2 must keep working: the disconnect was about pad1's keys only.
         e.dispatch(press("pad2", "b2", 1100));
-        check(taps(out->ops, "t") == 1, "c8-other-source-still-mapped", "");
+        check(tapsOf(*out, "t") == 1, "c8-other-source-still-mapped", "");
     }
 
     // ---- C9: a cancelled chord must not leave a modifier pressed -----------
@@ -536,12 +584,12 @@ int main() {
         };
         e.dispatch(press("s", "c", 1000));
 
-        check(taps(out->ops, "ctrl") == 1 && taps(out->ops, "a") == 1,
+        check(tapsOf(*out, "ctrl") == 1 && tapsOf(*out, "a") == 1,
               "c9-chord-was-pressed", "");
         check(out->heldKeys().empty(), "c9-chord-unwound",
               "held=" + std::to_string(out->heldKeys().size()));
-        check(count(out->ops, "up:ctrl") == 1, "c9-modifier-released", "");
-        check(count(out->ops, "up:a") == 1, "c9-key-released", "");
+        check(countOf(*out, "up:ctrl") == 1, "c9-modifier-released", "");
+        check(countOf(*out, "up:a") == 1, "c9-key-released", "");
         e.cancelAll();
         check(!e.cancelPending(), "c9-ack-clears-request", "");
     }
@@ -561,7 +609,7 @@ int main() {
         };
         e.dispatch(press("s", "c", 1000));
         check(out->heldKeys().empty(), "c9b-combo-tail-not-held", "");
-        check(count(out->ops, "up:ctrl") == 1, "c9b-pressed-member-released", "");
+        check(countOf(*out, "up:ctrl") == 1, "c9b-pressed-member-released", "");
         e.cancelAll();
     }
 
@@ -581,7 +629,7 @@ int main() {
         rt.post(press("s", "hold", 1));
         bool held = false;
         for (int i = 0; i < 200 && !held; ++i) {
-            held = out->isHeld("space");
+            held = out->isHeld("space");       // locked accessor
             if (!held) std::this_thread::sleep_for(std::chrono::milliseconds(5));
         }
         check(held, "c10-key-held-before-stop", "");
@@ -591,16 +639,25 @@ int main() {
         check(!rt.cancelPending(), "c10-no-residual-request-after-stop", "");
 
         // Restart: the queue must consume input again and the engine must accept
-        // new actions, proving the stop left no permanent block behind.
+        // new actions, proving the stop left no permanent block behind. Notified
+        // from the executor rather than polling recorded output.
+        std::mutex mu;
+        std::condition_variable cv;
+        bool nRan = false;
+        out->onKeyDown = [&](const std::string& key) {
+            if (key != "n") return;
+            { std::lock_guard<std::mutex> lk(mu); nRan = true; }
+            cv.notify_all();
+        };
         rt.start();
         rt.post(press("s", "tap", 2));
-        bool ran = false;
-        for (int i = 0; i < 200 && !ran; ++i) {
-            ran = taps(out->ops, "n") == 1;
-            if (!ran) std::this_thread::sleep_for(std::chrono::milliseconds(5));
+        {
+            std::unique_lock<std::mutex> lk(mu);
+            cv.wait_for(lk, std::chrono::seconds(10), [&] { return nRan; });
         }
-        check(ran, "c10-action-runs-after-restart", "");
         rt.stop();
+        check(nRan, "c10-action-runs-after-restart", "");
+        check(tapsOf(*out, "n") == 1, "c10-exactly-one-action", "");
     }
 
     // ---- C7: a request raised DURING cleanup stays pending -----------------
@@ -613,7 +670,7 @@ int main() {
         e.addBinding(b);
 
         e.dispatch(press("s", "c", 1000));           // baseline: one tap
-        check(taps(out->ops, "x") == 1, "c7-baseline-tap", "");
+        check(tapsOf(*out, "x") == 1, "c7-baseline-tap", "");
 
         const uint64_t first = e.requestStop();
         e.cancelAll(first);                          // complete the first stop
@@ -627,13 +684,13 @@ int main() {
         e.cancelAll(first);                          // stale acknowledge
         check(e.cancelPending(), "c7-stale-ack-does-not-clear-newer-request", "");
         e.dispatch(press("s", "c", 1200));
-        check(taps(out->ops, "x") == 1, "c7-dispatch-blocked-by-newer-request",
-              "taps=" + std::to_string(taps(out->ops, "x")));
+        check(tapsOf(*out, "x") == 1, "c7-dispatch-blocked-by-newer-request",
+              "taps=" + std::to_string(tapsOf(*out, "x")));
 
         e.cancelAll(second);
         check(!e.cancelPending(), "c7-newer-request-acknowledged", "");
         e.dispatch(press("s", "c", 1300));
-        check(taps(out->ops, "x") == 2, "c7-runs-after-correct-ack", "");
+        check(tapsOf(*out, "x") == 2, "c7-runs-after-correct-ack", "");
     }
 
     // ---- C11: a newer request's cleanup must not acknowledge an older stop ---
@@ -672,13 +729,13 @@ int main() {
 
         // And the stop must still actually block new actions.
         e.dispatch(press("s", "c", 1100));
-        check(taps(out->ops, "x") == 0, "c11-dispatch-still-blocked", "");
+        check(tapsOf(*out, "x") == 0, "c11-dispatch-still-blocked", "");
 
         // Completing the stop for real clears it.
         e.cancelAll(stopEpoch);
         check(!e.stopPending(), "c11-stop-cleared-by-own-ack", "");
         e.dispatch(press("s", "c", 1200));
-        check(taps(out->ops, "x") == 1, "c11-runs-after-stop-ack", "");
+        check(tapsOf(*out, "x") == 1, "c11-runs-after-stop-ack", "");
     }
 
     // ---- C12: the same interleaving through the runtime's control channel ---
@@ -714,7 +771,7 @@ int main() {
 
         // ...and the still-unhandled stop must keep blocking new actions.
         rt.engine().dispatch(press("s", "c", 1100));
-        check(taps(out->ops, "x") == 0, "c12-still-blocked-by-unhandled-stop", "");
+        check(tapsOf(*out, "x") == 0, "c12-still-blocked-by-unhandled-stop", "");
 
         // The queued CancelAll (newest epoch) finally performs the global release
         // and clears everything, including the out-of-order source cancel.
@@ -780,14 +837,14 @@ int main() {
         check(!rt.cancelPending(), "c14-stop-applied", "");
         check(rt.pending() == 0, "c14-stale-actions-dropped",
               "pending=" + std::to_string(rt.pending()));
-        check(taps(out->ops, "k") == 0, "c14-none-ran", "");
+        check(tapsOf(*out, "k") == 0, "c14-none-ran", "");
         check(rt.eventsDroppedByCancel() >= 5, "c14-drops-counted",
               "dropped=" + std::to_string(rt.eventsDroppedByCancel()));
 
         // A later legitimate action still runs.
         rt.post(press("s", "c", 9));
         check(rt.processOne(0), "c14-later-accepted", "");
-        check(taps(out->ops, "k") == 1, "c14-later-ran", "");
+        check(tapsOf(*out, "k") == 1, "c14-later-ran", "");
     }
 
     // ---- C15: start() correctly restarts a stopped runtime -----------------
@@ -801,12 +858,20 @@ int main() {
 
         rt.start();
         rt.post(press("s", "c", 1));
-        bool ranFirst = false;
-        for (int i = 0; i < 200 && !ranFirst; ++i) {
-            ranFirst = taps(out->ops, "n") == 1;
-            if (!ranFirst) std::this_thread::sleep_for(std::chrono::milliseconds(5));
+        // Notified from the executor: no polling of recorded output.
+        std::mutex mu;
+        std::condition_variable cv;
+        int nDowns = 0;
+        out->onKeyDown = [&](const std::string& key) {
+            if (key != "n") return;
+            { std::lock_guard<std::mutex> lk(mu); ++nDowns; }
+            cv.notify_all();
+        };
+        {
+            std::unique_lock<std::mutex> lk(mu);
+            cv.wait_for(lk, std::chrono::seconds(10), [&] { return nDowns >= 1; });
         }
-        check(ranFirst, "c15-runs-before-stop", "");
+        check(nDowns >= 1, "c15-runs-before-stop", std::to_string(nDowns));
 
         rt.postCancelAll();
         rt.stop();
@@ -816,13 +881,12 @@ int main() {
         // Restart: the queue must be re-armed and the engine must accept input.
         rt.start();
         rt.post(press("s", "c", 2));
-        bool ranAfter = false;
-        for (int i = 0; i < 200 && !ranAfter; ++i) {
-            ranAfter = taps(out->ops, "n") == 2;
-            if (!ranAfter) std::this_thread::sleep_for(std::chrono::milliseconds(5));
+        {
+            std::unique_lock<std::mutex> lk(mu);
+            cv.wait_for(lk, std::chrono::seconds(10), [&] { return nDowns >= 2; });
         }
-        check(ranAfter, "c15-runs-after-restart", "");
         rt.stop();
+        check(nDowns >= 2, "c15-runs-after-restart", std::to_string(nDowns));
     }
 
     // ---- C16: cancellation during text output and key combinations ---------
@@ -838,10 +902,10 @@ int main() {
         e.addBinding(b);
         out->onTextChar = [&](int n) { if (n == 2) e.requestCancel(); };
         e.dispatch(press("s", "c", 1000));
-        check(taps(out->ops, "z") == 0, "c16-tail-skipped", "");
+        check(tapsOf(*out, "z") == 0, "c16-tail-skipped", "");
         check(out->heldKeys().empty(), "c16-no-keys-held", "");
         // The combo never ran: its keys were never pressed, so nothing to unwind.
-        check(count(out->ops, "down:ctrl") == 0, "c16-combo-not-started", "");
+        check(countOf(*out, "down:ctrl") == 0, "c16-combo-not-started", "");
         e.cancelAll();
 
         // Key release after external cancellation, mid-combo.
@@ -856,7 +920,7 @@ int main() {
         e2.dispatch(press("s", "c", 1000));
         check(out2->heldKeys().empty(), "c16-mid-combo-unwound",
               "held=" + std::to_string(out2->heldKeys().size()));
-        check(count(out2->ops, "up:ctrl") == 1, "c16-pressed-member-released", "");
+        check(countOf(*out2, "up:ctrl") == 1, "c16-pressed-member-released", "");
         e2.cancelAll();
     }
 
@@ -989,7 +1053,7 @@ int main() {
               "c18-no-inline-engine-mutation-during-join",
               "before=" + std::to_string(inlineBefore) +
               " atBoundary=" + std::to_string(inlineAtBoundary.load()));
-        check(taps(out->ops, "z") == 0, "c18-no-action-after-stop", "");
+        check(tapsOf(*out, "z") == 0, "c18-no-action-after-stop", "");
         check(out->heldKeys().empty(), "c18-no-stuck-keys", "");
 
         // The decisive assertion. Every producer above either queued its request
@@ -998,18 +1062,27 @@ int main() {
         // Post-stop, with the thread gone, inline cleanups are expected and safe.
         check(!rt.cancelPending(), "c18-inline-stop-clears-request", "");
 
-        // Restart must work and process fresh input.
+        // Restart must work and process fresh input. Notified from the executor,
+        // so the test thread never polls the backend's recorded output.
         Binding fast; fast.id = "c18f"; fast.match = {"s", "quick", EventType::Pressed};
         Action tq; tq.kind = ActionKind::KeyTap; tq.key = "y"; fast.script = {tq};
         rt.engine().addBinding(fast);
+        std::mutex ymu;
+        std::condition_variable ycv;
+        bool yRan = false;
+        out->onKeyDown = [&](const std::string& key) {
+            if (key != "y") return;
+            { std::lock_guard<std::mutex> lk(ymu); yRan = true; }
+            ycv.notify_all();
+        };
         rt.start();
         rt.post(press("s", "quick", 2));
-        bool ranAfter = false;
-        for (int i = 0; i < 200 && !ranAfter; ++i) {
-            ranAfter = taps(out->ops, "y") >= 1;
-            if (!ranAfter) std::this_thread::sleep_for(std::chrono::milliseconds(5));
+        {
+            std::unique_lock<std::mutex> lk(ymu);
+            ycv.wait_for(lk, std::chrono::seconds(10), [&] { return yRan; });
         }
-        check(ranAfter, "c18-runs-after-restart", "");
+        rt.stop();
+        check(yRan, "c18-runs-after-restart", "");
         rt.postCancelAll();
         std::this_thread::sleep_for(std::chrono::milliseconds(80));
         check(out->heldKeys().empty(), "c18-no-stuck-keys-after-second-stop", "");
@@ -1037,10 +1110,11 @@ int main() {
         std::condition_variable cv;
         bool acked = false;
         bool postedFromHook = false;
+        bool postStopActionRan = false;
 
-        // This fires on the EXECUTOR thread, immediately after the stop becomes
-        // externally visible and before handle() returns. It is the precise window
-        // the old ordering left open. The producer's post here is the legitimate
+        // Fires on the EXECUTOR thread, immediately after the stop becomes
+        // externally visible and before handle() returns - the precise window the
+        // old ordering left open. The producer's post here is the legitimate
         // post-stop event that must survive.
         rt.setOnStopAcknowledged([&] {
             {
@@ -1052,6 +1126,18 @@ int main() {
             cv.notify_all();
         });
 
+        // Fires on the EXECUTOR thread when the post-stop action's key goes down.
+        // This replaces polling `ops`: the test learns about the operation through
+        // a synchronised notification instead of reading shared state concurrently.
+        out->onKeyDown = [&](const std::string& key) {
+            if (key != "k") return;
+            {
+                std::lock_guard<std::mutex> lk(mu);
+                postStopActionRan = true;
+            }
+            cv.notify_all();
+        };
+
         rt.start();                       // the ONLY consumer from here on
 
         // Pre-stop work, known to be enqueued before the control item.
@@ -1059,31 +1145,31 @@ int main() {
         rt.post(press("s", "c", 2));
         rt.postCancelAll();               // queued control item (priority channel)
 
-        // Wait (bounded) for the executor to reach the acknowledgement boundary.
+        // Wait (bounded) for the executor to reach BOTH boundaries: acknowledgement
+        // and the post-stop action executing. No sleep-based polling, and no read
+        // of `ops` while the executor may be writing it.
         {
             std::unique_lock<std::mutex> lk(mu);
-            bool reached = cv.wait_for(lk, std::chrono::seconds(10), [&] { return acked; });
-            check(reached, "c19-executor-reached-acknowledgement", "");
+            check(cv.wait_for(lk, std::chrono::seconds(10),
+                              [&] { return acked; }),
+                  "c19-executor-reached-acknowledgement", "");
+            check(cv.wait_for(lk, std::chrono::seconds(10),
+                              [&] { return postStopActionRan; }),
+                  "c19-post-stop-action-executed", "");
         }
 
-        // Let the single consumer finish the post-stop event too, then stop it
-        // before asserting, so no assertion races the executor.
-        bool ranAfter = false;
-        for (int i = 0; i < 200 && !ranAfter; ++i) {
-            ranAfter = taps(out->ops, "k") >= 1;
-            if (!ranAfter) std::this_thread::sleep_for(std::chrono::milliseconds(5));
-        }
         rt.stop();                        // join: no consumer remains
 
+        // Only now is it safe to inspect the backend's recorded operations.
         check(postedFromHook, "c19-producer-posted-at-boundary", "");
         check(!rt.cancelPending(), "c19-stop-complete", "");
 
-        const int ran = taps(out->ops, "k");
+        const auto ops = out->snapshot();
+        const int ran = taps(ops, "k");
         check(ran == 1, "c19-exactly-the-post-stop-event-ran",
               "ran=" + std::to_string(ran));
         check(rt.eventsDroppedByCancel() >= 2, "c19-pre-stop-events-dropped",
               "dropped=" + std::to_string(rt.eventsDroppedByCancel()));
-        check(!ranAfter || ran == 1, "c19-no-extra-action", "");
 
         // Single-consumer check: the queue is empty now that the executor drained
         // it and stopped. processOne() is used only AFTER the executor is gone.
@@ -1106,7 +1192,7 @@ int main() {
         check(!e.cancelPending(), "c20-cancelall-default-not-pending", "");
         check(!e.stopPending(), "c20-cancelall-default-no-stop", "");
         e.dispatch(press("s", "c", 1));
-        check(taps(out->ops, "k") == 1, "c20-runs-after-default-cancelall", "");
+        check(tapsOf(*out, "k") == 1, "c20-runs-after-default-cancelall", "");
 
         // Same for cancelSource(): a direct call must not leave a pending request.
         e.cancelSource("s");
@@ -1118,7 +1204,7 @@ int main() {
         e.cancelAll();
         check(!e.cancelPending(), "c20-direct-call-clears-outstanding", "");
         e.dispatch(press("s", "c", 2));
-        check(taps(out->ops, "k") == 2, "c20-runs-after-clearing", "");
+        check(tapsOf(*out, "k") == 2, "c20-runs-after-clearing", "");
     }
 
     // ---- C20b: default cancelSource() after a request was published ---------
@@ -1149,7 +1235,7 @@ int main() {
         // The call covered that request, so it must not be left pending.
         check(!e.cancelPending(), "c20b-default-call-clears-handled-request", "");
         e.dispatch(press("s", "c", 1));
-        check(taps(out->ops, "k") == 1, "c20b-dispatch-resumes", "");
+        check(tapsOf(*out, "k") == 1, "c20b-dispatch-resumes", "");
 
         // A per-source cleanup must NOT acknowledge a GLOBAL stop that it did not
         // cover: a stop published BEFORE the snapshot stays pending (only a global
@@ -1163,7 +1249,7 @@ int main() {
         e.cancelAll();
         check(!e.cancelPending(), "c20b-global-cleanup-clears", "");
         e.dispatch(press("s", "c", 2));
-        check(taps(out->ops, "k") == 2, "c20b-runs-after-global-cleanup", "");
+        check(tapsOf(*out, "k") == 2, "c20b-runs-after-global-cleanup", "");
     }
 
     // ---- C21: an unresolved record must never release another holder's key ---
@@ -1297,6 +1383,127 @@ int main() {
         // After completion the stop is done and dispatch proceeds normally.
         check(!rt.cancelPending(), "c22-stop-complete-after-barrier", "");
         check(rt.eventsDroppedByCancel() >= 1, "c22-pre-stop-event-dropped", "");
+    }
+
+    // ---- C23: a source-scoped cleanup must NEVER acknowledge a global Stop ----
+    // Regression for: cancelSource() snapshotted cancelEpoch_ and acknowledged that
+    // epoch regardless of request SCOPE. With device B holding a key, a global Stop
+    // at epoch N could be "acknowledged" by cancelSource("padA") - which releases
+    // only padA's keys - so stopPending() went false while B's key stayed down.
+    section("C23 source cleanup must not satisfy a global Stop");
+    {
+        auto out = std::make_shared<HookBackend>();
+        Engine e(out);
+        // Device B holds Space; padA has its own binding.
+        Binding holdB; holdB.id = "c23B"; holdB.match = {"padB", "b", EventType::Pressed};
+        holdB.trigger = TriggerKind::Momentary; holdB.holdKey = "space";
+        Binding actA; actA.id = "c23A"; actA.match = {"padA", "x", EventType::Pressed};
+        Action ta; ta.kind = ActionKind::KeyTap; ta.key = "k"; actA.script = {ta};
+        e.addBinding(holdB);
+        e.addBinding(actA);
+
+        e.dispatch(press("padB", "b", 1000));
+        check(out->isHeld("space"), "c23-B-holds-space", "");
+
+        // A. Direct default-argument regression.
+        const uint64_t stopEpoch = e.requestStop();
+        e.cancelSource("padA");                       // default epoch: only padA
+        check(e.stopPending(), "c23-default-stop-still-pending", "");
+        check(!e.cancelAcknowledged(stopEpoch), "c23-default-stop-not-acked", "");
+        // B's key must remain held: the global release has not run.
+        check(e.heldKeys().size() == 1 && out->isHeld("space"),
+              "c23-B-key-still-held", "");
+
+        // Global cleanup then releases it and acknowledges the Stop.
+        e.cancelAll();
+        check(!e.stopPending(), "c23-global-cleanup-acks-stop", "");
+        check(!out->isHeld("space"), "c23-global-cleanup-released-space", "");
+        check(!e.cancelPending(), "c23-nothing-pending", "");
+
+        // B. Explicit-epoch regression: passing a Stop epoch to cancelSource()
+        // must not acknowledge it either.
+        e.dispatch(press("padB", "b", 2000));
+        check(out->isHeld("space"), "c23-B-holds-again", "");
+        const uint64_t stopEpoch2 = e.requestStop();
+        e.cancelSource("padA", stopEpoch2);           // explicit Stop epoch
+        check(e.stopPending(), "c23-explicit-stop-still-pending", "");
+        check(!e.cancelAcknowledged(stopEpoch2), "c23-explicit-stop-not-acked", "");
+        check(out->isHeld("space"), "c23-explicit-B-key-still-held", "");
+        e.cancelAll();
+        check(!e.stopPending() && !out->isHeld("space"),
+              "c23-explicit-global-cleanup-works", "");
+    }
+
+    // ---- C24: mixed request ordering (both directions) ----------------------
+    // Uses the DEFAULT argument deliberately: that is the path that snapshots the
+    // CURRENT epoch, so with a mixed order the snapshot can land exactly on the
+    // Stop epoch. Explicit single-epoch calls cannot reproduce the scope defect,
+    // which is why this test would silently pass against the unfixed code if it
+    // passed explicit epochs only.
+    section("C24 mixed cancellation and stop ordering");
+    {
+        auto out = std::make_shared<HookBackend>();
+        Engine e(out);
+        Binding holdB; holdB.id = "c24B"; holdB.match = {"padB", "b", EventType::Pressed};
+        holdB.trigger = TriggerKind::Momentary; holdB.holdKey = "space";
+        Binding actA; actA.id = "c24A"; actA.match = {"padA", "x", EventType::Pressed};
+        Action ta; ta.kind = ActionKind::KeyTap; ta.key = "k"; actA.script = {ta};
+        e.addBinding(holdB);
+        e.addBinding(actA);
+
+        // --- Order 1: ordinary cancel at N, Stop at N+1. ---
+        // cancelSource() with the DEFAULT argument snapshots the newest epoch,
+        // which here IS the Stop. It covers the ordinary cancel at N but must not
+        // acknowledge the Stop at N+1.
+        e.dispatch(press("padB", "b", 1000));
+        const uint64_t cancelEp = e.requestCancel();      // N
+        const uint64_t stopEp   = e.requestStop();        // N+1
+        check(stopEp > cancelEp, "c24-order1-epochs", "");
+        e.cancelSource("padA");                           // default: snapshot = N+1
+        check(e.cancelAcknowledged(cancelEp), "c24-order1-collateral-acked", "");
+        check(!e.cancelAcknowledged(stopEp), "c24-order1-stop-not-acked", "");
+        check(e.stopPending(), "c24-order1-stop-pending", "");
+        check(out->isHeld("space"), "c24-order1-B-held", "");
+        e.cancelAll();
+        check(!e.cancelPending() && !out->isHeld("space"),
+              "c24-order1-global-resolves", "");
+
+        // --- Order 2: Stop at N, ordinary cancel at N+1. ---
+        // Here the default snapshot is the ordinary cancel at N+1, so that request
+        // MUST be acknowledged (not stranded) while the older Stop stays pending.
+        e.dispatch(press("padB", "b", 2000));
+        const uint64_t stopEp2   = e.requestStop();       // N
+        const uint64_t cancelEp2 = e.requestCancel();     // N+1
+        check(cancelEp2 > stopEp2, "c24-order2-epochs", "");
+        e.cancelSource("padA");                           // default: snapshot = N+1
+        check(e.cancelAcknowledged(cancelEp2), "c24-order2-collateral-acked", "");
+        check(!e.cancelAcknowledged(stopEp2), "c24-order2-stop-not-acked", "");
+        check(e.stopPending(), "c24-order2-stop-pending", "");
+        check(out->isHeld("space"), "c24-order2-B-held", "");
+        e.cancelAll();
+        check(!e.cancelPending() && !out->isHeld("space"),
+              "c24-order2-global-resolves", "");
+
+        // Two stops outstanding: the OLDER one must survive a source cleanup too,
+        // proving the check is not a comparison against only stopEpoch_.
+        e.dispatch(press("padB", "b", 3000));
+        const uint64_t stopA = e.requestStop();           // older stop
+        const uint64_t stopB = e.requestStop();           // newer stop
+        check(stopB > stopA, "c24-two-stops-epochs", "");
+        e.cancelSource("padA", 0);                        // default snapshot = stopB
+        check(!e.cancelAcknowledged(stopA), "c24-older-stop-not-acked", "");
+        check(!e.cancelAcknowledged(stopB), "c24-newer-stop-not-acked", "");
+        check(e.stopPending(), "c24-any-stop-pending", "");
+        check(out->isHeld("space"), "c24-two-stops-B-held", "");
+        e.cancelAll();
+        check(!e.cancelPending() && !out->isHeld("space"),
+              "c24-two-stops-global-resolves", "");
+
+        // Legacy invariant preserved: requestCancel(); cancelSource(src) must not
+        // strand the ordinary cancellation it handled.
+        e.requestCancel();
+        e.cancelSource("padA");
+        check(!e.cancelPending(), "c24-legacy-cancel-not-stranded", "");
     }
 
     std::printf("\n%d checks, %d passed, %d failed\n", g_check, g_pass, g_fail);

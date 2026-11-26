@@ -169,6 +169,28 @@ Acknowledging before step 2 let a producer observe completion, post a legitimate
 event, and lose it to the sweep that ran afterwards. The no-executor path in
 `postCancelAll()` uses the same three-step order.
 
+### Cancellation request scopes
+
+Requests carry a **scope**, and only a cleanup that satisfies a scope may
+acknowledge it:
+
+| Producer | Scope | Satisfied by |
+|---|---|---|
+| `requestCancel()` | ordinary cancellation | `cancelSource()` (or global cleanup) |
+| `requestStop()` | global Stop | `cancelAll()` / `acknowledgeStop()` **only** |
+
+`requestStop()` records its epoch in the engine's stop set before returning, so a
+cleanup can always tell whether the request it is about to handle is a Stop.
+`cancelSource()` acknowledges only the ordinary cancellations at or below its
+snapshot epoch and skips any Stop - whether the epoch was passed explicitly or
+obtained through the default argument. Releasing one device's keys is not the
+global release a Stop requires, so acknowledging a Stop there would clear
+`stopPending()` while another device's key is still down.
+
+Multiple stops can be outstanding at once; each is tracked individually, so an
+older unhandled Stop is never satisfied by a newer source cleanup and a newer
+Stop is never satisfied by an older one.
+
 ### Output release accounting
 
 `SendInputBackend::send()` checks the value returned by `SendInput()`. A physical

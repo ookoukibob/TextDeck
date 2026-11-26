@@ -195,6 +195,12 @@ bool Engine::match(const Binding& b, const Event& e) const {
     return true;
 }
 
+bool Engine::isStopLocked(uint64_t epoch) const {
+    // Caller holds cancelTrackMu_.
+    if (epoch == 0) return false;
+    return std::binary_search(stopRequests_.begin(), stopRequests_.end(), epoch);
+}
+
 bool Engine::ackCoveredLocked(uint64_t epoch) const {
     // Caller holds cancelTrackMu_ (or passes a snapshot it already owns).
     if (epoch == 0) return true;                       // "no request" is trivially done
@@ -279,10 +285,37 @@ void Engine::acknowledgeCancel(uint64_t epoch) {
     if (!anyPending) cancelRequested_.store(false, std::memory_order_release);
 }
 
+void Engine::acknowledgeSourceCleanup(uint64_t coveredEpoch) {
+    // A SOURCE-SCOPED cleanup released one source's keys. That satisfies ordinary
+    // cancellation requests at or below `coveredEpoch`, but it does NOT satisfy a
+    // global Stop: a Stop demands every key released, including keys held by other
+    // devices. Acknowledging a Stop here would clear stopPending() while another
+    // device's key is still down, which is the defect this method exists to
+    // prevent - whether the epoch arrived explicitly or through the default
+    // argument.
+    if (coveredEpoch == 0) return;
+    std::lock_guard<std::mutex> lk(cancelTrackMu_);
+    const uint64_t acked = cancelAcked_.load(std::memory_order_acquire);
+    for (uint64_t e = acked + 1; e <= coveredEpoch; ++e) {
+        if (isStopLocked(e)) continue;          // global scope: leave pending
+        if (ackCoveredLocked(e)) continue;      // already handled
+        ackOutOfOrder_.push_back(e);
+    }
+    std::sort(ackOutOfOrder_.begin(), ackOutOfOrder_.end());
+    ackOutOfOrder_.erase(std::unique(ackOutOfOrder_.begin(), ackOutOfOrder_.end()),
+                         ackOutOfOrder_.end());
+    foldAckedLocked();
+    // The diagnostic flag is cleared only when nothing at all is outstanding.
+    const uint64_t nowAcked = cancelAcked_.load(std::memory_order_acquire);
+    bool anyPending = cancelEpoch_.load(std::memory_order_acquire) > nowAcked;
+    for (uint64_t e : ackOutOfOrder_) if (e > nowAcked) { anyPending = true; break; }
+    if (!anyPending) cancelRequested_.store(false, std::memory_order_release);
+}
+
 void Engine::acknowledgeCancelThrough(uint64_t epoch) {
     // A global cleanup handled everything that was pending when it ran, so every
-    // request up to `epoch` is complete - including requests that a scoped
-    // cancelSource had cleaned up out of order.
+    // request up to `epoch` is complete - including a global Stop and requests a
+    // scoped cancelSource had cleaned up out of order.
     if (epoch == 0) return;
     std::lock_guard<std::mutex> lk(cancelTrackMu_);
     uint64_t prev = cancelAcked_.load(std::memory_order_acquire);
@@ -292,7 +325,14 @@ void Engine::acknowledgeCancelThrough(uint64_t epoch) {
                                                std::memory_order_acquire)) {
     }
     foldAckedLocked();
+    // Stop records at or below the watermark can never be consulted again: a
+    // source cleanup only ever asks about epochs above it. Pruning keeps the set
+    // small on a long-lived engine.
     const uint64_t acked = cancelAcked_.load(std::memory_order_acquire);
+    stopRequests_.erase(
+        std::remove_if(stopRequests_.begin(), stopRequests_.end(),
+                       [acked](uint64_t e) { return e <= acked; }),
+        stopRequests_.end());
     bool anyPending = cancelEpoch_.load(std::memory_order_acquire) > acked;
     for (uint64_t e : ackOutOfOrder_) if (e > acked) { anyPending = true; break; }
     if (!anyPending) cancelRequested_.store(false, std::memory_order_release);
@@ -658,18 +698,21 @@ void Engine::cancelSource(const std::string& source, uint64_t requestEpoch) {
         else ++it;
     }
     // A per-source stop is complete once that source's keys are released and its
-    // stale trigger state is gone, so the request this cleanup covers is
-    // acknowledged - for BOTH the explicit-epoch form (queued control item) and
-    // the legacy default form. Leaving the default form unacknowledged would let
+    // stale trigger state is gone, so the ordinary cancellation requests this
+    // cleanup covers are acknowledged - for BOTH the explicit-epoch form (queued
+    // control item) and the legacy default form. Leaving the default form
+    // unacknowledged would let
     //   requestCancel(); cancelSource("padA");
     // strand a request that this call already handled, blocking every later
     // dispatch forever.
     //
-    // Only the SNAPSHOTTED epoch is acknowledged, never a range: this sweep does
-    // not cover other requests (a global stop for an older epoch still owes a full
-    // releaseAll), so acknowledging a range would unblock dispatch too early. A
-    // newer request that arrived after the snapshot keeps its own pending state.
-    if (covered) acknowledgeCancel(covered);
+    // It must NOT acknowledge a GLOBAL Stop. A source cleanup releases one source's
+    // keys; a Stop requires every key released, including other devices'. That
+    // holds whether the epoch was passed explicitly or snapshotted here, so the
+    // scope check lives in acknowledgeSourceCleanup() rather than in a comparison
+    // against the current stop epoch (which would be wrong with several stops
+    // pending).
+    acknowledgeSourceCleanup(covered);
 }
 
 void Engine::releaseAllKeys() {
@@ -724,6 +767,17 @@ uint64_t Engine::requestStop() {
            !stopEpoch_.compare_exchange_weak(prev, epoch,
                                              std::memory_order_acq_rel,
                                              std::memory_order_acquire)) {
+    }
+    // Record the request's SCOPE before returning, so any later cleanup can tell
+    // whether it actually covers this request. This must happen before a producer
+    // could acknowledge the epoch (it has not received the value yet), so there is
+    // no window in which a Stop looks like an ordinary cancellation.
+    {
+        std::lock_guard<std::mutex> lk(cancelTrackMu_);
+        if (!isStopLocked(epoch)) {
+            stopRequests_.push_back(epoch);
+            std::sort(stopRequests_.begin(), stopRequests_.end());
+        }
     }
     return epoch;
 }

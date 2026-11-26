@@ -240,8 +240,17 @@ private:
     // Acknowledge every request up to and including `epoch`. Only a GLOBAL
     // cleanup (cancelAll: release every key, clear every trigger) may do this,
     // because its work is a superset of what those requests needed. A scoped
-    // cancelSource must use acknowledgeCancel() for its own epoch alone.
+    // cancelSource must use acknowledgeSourceCleanup() instead.
     void acknowledgeCancelThrough(uint64_t epoch);
+    // Acknowledge the requests a SOURCE-SCOPED cleanup actually covers: every
+    // ordinary cancellation at or below `coveredEpoch`, but NEVER a global Stop,
+    // even when the caller reached this path through the default-argument form.
+    // A source cleanup releases only that source's keys, so it cannot satisfy a
+    // request that demands a global release.
+    void acknowledgeSourceCleanup(uint64_t coveredEpoch);
+    // True when this epoch was published by requestStop() (global scope).
+    // Caller must hold cancelTrackMu_.
+    bool isStopLocked(uint64_t epoch) const;
     // True when this epoch is covered by the in-order watermark or was recorded
     // out of order. Caller must hold cancelTrackMu_.
     bool ackCoveredLocked(uint64_t epoch) const;
@@ -292,6 +301,12 @@ private:
     // is read by producers polling stopPending() and written by the executor.
     mutable std::mutex cancelTrackMu_;
     std::vector<uint64_t> ackOutOfOrder_;
+    // Epochs published by requestStop(). A source-scoped cleanup must never
+    // acknowledge one of these: releasing a single source's keys is not the global
+    // release a Stop demands. Kept as a sorted set because several stops can be
+    // outstanding at once and producers may publish concurrently. Guarded by
+    // cancelTrackMu_; entries at or below cancelAcked_ are pruned.
+    std::vector<uint64_t> stopRequests_;
     // Kept for diagnostics; never the decision variable (that is the epoch logic).
     std::atomic<bool> cancelRequested_{false};
     size_t textFailures_ = 0;   // executor-thread only, like the rest of the state
