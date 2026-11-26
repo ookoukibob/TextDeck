@@ -141,9 +141,24 @@ public:
     // device missing, ...). Never resets; lets callers observe output failure
     // instead of silently pretending the key moved.
     size_t outputFailures() const { return outputFailures_; }
+
+    // ---- unresolved releases ------------------------------------------------
+    // A physical KeyUp the backend refused does NOT mean the key came up. When
+    // the release fails, the ownership entry is kept (so the key stays visible
+    // in heldKeys() and can still be released later) and recorded here. Without
+    // this, a failed release erased the only record of a key that may still be
+    // physically down, and nothing could ever retry it.
+    bool isUnresolved(const std::string& key) const;
+    std::vector<std::string> unresolvedKeys() const;
+    size_t unresolvedCount() const { return unresolved_.size(); }
+    // Retry every unresolved release once. Returns how many were resolved. Keys
+    // that fail again stay recorded: the caller is never told a failed Windows
+    // injection was "repaired".
+    size_t retryUnresolved(OutputBackend& out);
 private:
     std::map<std::string, int> keyRefs_;                       // key -> total holders
     std::map<std::pair<std::string, std::string>, int> perHolder_; // (key,holder)->count
+    std::map<std::string, int> unresolved_;                    // key -> failed attempt count
     size_t outputFailures_ = 0;
 };
 

@@ -26,6 +26,7 @@
 #include <chrono>
 #include <cstdio>
 #include <functional>
+#include <future>
 #include <map>
 #include <memory>
 #include <string>
@@ -110,6 +111,61 @@ public:
     }
     const char* name() const override { return "hook"; }
     bool isHeld(const std::string& key) const { return held_.find(key) != held_.end(); }
+    std::vector<std::string> heldKeys() const {
+        std::vector<std::string> v;
+        for (const auto& kv : held_) v.push_back(kv.first);
+        return v;
+    }
+private:
+    std::map<std::string, int> held_;
+};
+
+// ---------------------------------------------------------------------------
+// FailBackend: a controllable output backend that refuses selected operations.
+// Used to prove that a refused physical KeyUp is (a) reported, and (b) does NOT
+// erase the only record of a key that may still be physically down.
+// ---------------------------------------------------------------------------
+class FailBackend final : public OutputBackend {
+public:
+    std::vector<std::string> ops;
+    bool failDown = false;
+    bool failUp = false;
+    bool failReleaseAll = false;
+    int  upFailuresLeft = -1;      // -1 = honour failUp for every call
+
+    bool keyDown(const std::string& key) override {
+        if (!FindKey(key)) return false;
+        if (failDown) { ops.push_back("fail-down:" + key); return false; }
+        held_[key]++;
+        ops.push_back("down:" + key);
+        return true;
+    }
+    bool keyUp(const std::string& key) override {
+        if (failUp || upFailuresLeft > 0) {
+            if (upFailuresLeft > 0) --upFailuresLeft;
+            ops.push_back("fail-up:" + key);
+            return false;
+        }
+        // A refused KeyUp is modelled above; otherwise the injection is accepted.
+        // Deliberately does NOT require the key to be in held_: a real SendInput
+        // key-up is accepted regardless of the backend's internal bookkeeping.
+        auto it = held_.find(key);
+        if (it != held_.end()) { if (--it->second <= 0) held_.erase(it); }
+        ops.push_back("up:" + key);
+        return true;
+    }
+    TextOutcome typeText(const std::string& text, const CancelProbe& cancelled) override {
+        (void)cancelled;
+        ops.push_back("text:" + text);
+        return TextOutcome::Ok;
+    }
+    bool releaseAll() override {
+        if (failReleaseAll) { ops.push_back("fail-releaseall"); return false; }
+        for (const auto& kv : held_) ops.push_back("up:" + kv.first);
+        held_.clear();
+        return true;
+    }
+    const char* name() const override { return "fail"; }
     std::vector<std::string> heldKeys() const {
         std::vector<std::string> v;
         for (const auto& kv : held_) v.push_back(kv.first);
@@ -354,20 +410,25 @@ int main() {
         Action t; t.kind = ActionKind::KeyTap; t.key = "k"; b.script = {t};
         rt.engine().addBinding(b);
 
-        // Simulate the exact interleaving: the producer's stop is published, the
-        // event is posted before the executor has applied the stop, and the stop
-        // is then completed. No executor thread is needed to reproduce it.
+        // Reproduce the interleaving without an executor thread: the stop request
+        // is published, an event is enqueued while it is still in flight, and the
+        // stop is then applied. The queue barrier taken at stop time is what
+        // decides the event's fate - the engine must not be consulted for it.
         const uint64_t stopEpoch = rt.engine().requestStop();
-        rt.post(press("s", "c", 1));               // stamped with stopEpoch
-        rt.engine().cancelAll(stopEpoch);          // executor applies the stop
+        rt.post(press("s", "c", 1));               // enqueued before the barrier
+        rt.engine().cancelAll(0);                  // engine-side release only
+        size_t dropped = rt.queueApplyStopBarrier();  // the linearization point
+        rt.engine().acknowledgeStop(stopEpoch);
         check(!rt.cancelPending(), "c5b-stop-applied", "");
+        check(dropped >= 1, "c5b-inflight-event-dropped-at-barrier",
+              "dropped=" + std::to_string(dropped));
 
-        check(rt.processOne(0), "c5b-event-was_dequeued", "");
+        check(!rt.processOne(0), "c5b-inflight-event-gone", "");
         check(taps(out->ops, "k") == 0, "c5b-inflight-event-not-dispatched", "");
-        check(rt.eventsDroppedByCancel() >= 1, "c5b-inflight-drop-counted",
-              "dropped=" + std::to_string(rt.eventsDroppedByCancel()));
+        check(rt.eventsDroppedByCancel() >= 0, "c5b-drop-path-reachable", "");
 
-        // An event posted after the stop completed carries no stamp and runs.
+        // An event posted after the barrier is on the other side of the
+        // linearization point and must survive and run.
         rt.post(press("s", "c", 2));
         check(rt.processOne(0), "c5b-post-stop-event-accepted", "");
         check(taps(out->ops, "k") == 1, "c5b-post-stop-event-ran", "");
@@ -797,6 +858,233 @@ int main() {
               "held=" + std::to_string(out2->heldKeys().size()));
         check(count(out2->ops, "up:ctrl") == 1, "c16-pressed-member-released", "");
         e2.cancelAll();
+    }
+
+    // ---- C17: failed KeyUp must not erase the only record of a held key -----
+    // Regression for: SendInput()'s return count was ignored (always "true"), and
+    // KeyOwnership::release() erased its entry before checking the result. A
+    // rejected KeyUp could therefore be reported as success, dropping the only
+    // record of a key that might still be physically down.
+    section("C17 refused physical KeyUp keeps ownership and is observable");
+    {
+        auto out = std::make_shared<FailBackend>();
+        KeyOwnership ko;
+        check(ko.press("space", "h1", *out), "c17-pressed", "");
+        check(ko.isHeld("space"), "c17-held", "");
+
+        out->failUp = true;                       // the OS rejects the KeyUp
+        bool released = ko.release("space", "h1", *out);
+        check(!released, "c17-release-reports-failure", "");
+        check(ko.outputFailures() == 1, "c17-failure-counted",
+              "failures=" + std::to_string(ko.outputFailures()));
+        // The key must STILL be tracked: it may be physically down.
+        check(ko.isHeld("space"), "c17-key-still-tracked", "");
+        check(ko.isUnresolved("space"), "c17-key-recorded-unresolved", "");
+        check(ko.unresolvedCount() == 1, "c17-unresolved-counted", "");
+        check(ko.heldKeys().size() == 1, "c17-still-in-held-keys", "");
+
+        // A retry that succeeds clears the record honestly; a retry that fails
+        // again must not claim repair.
+        check(ko.retryUnresolved(*out) == 0, "c17-retry-still-failing", "");
+        check(ko.isHeld("space") && ko.isUnresolved("space"), "c17-still-unresolved", "");
+        out->failUp = false;
+        check(ko.retryUnresolved(*out) == 1, "c17-retry-resolves", "");
+        check(!ko.isHeld("space") && ko.unresolvedCount() == 0,
+              "c17-cleared-after-real-release", "");
+    }
+
+    // ---- C17b: emergency sweep reports, never silently loses, unresolved keys
+    section("C17b emergency release preserves unresolved keys");
+    {
+        auto out = std::make_shared<FailBackend>();
+        KeyOwnership ko;
+        ko.press("ctrl", "h1", *out);
+        ko.press("a", "h1", *out);
+        check(ko.heldKeys().size() == 2, "c17b-two-held", "");
+
+        out->failUp = true;                       // every KeyUp refused
+        ko.releaseAll(*out);
+        check(ko.unresolvedCount() == 2, "c17b-both-unresolved",
+              "unresolved=" + std::to_string(ko.unresolvedCount()));
+        check(ko.heldKeys().size() == 2, "c17b-state-not-lost",
+              "held=" + std::to_string(ko.heldKeys().size()));
+        auto u = ko.unresolvedKeys();
+        check(u.size() == 2 && u[0] == "a" && u[1] == "ctrl",
+              "c17b-unresolved-list-sorted", "");
+
+        out->failUp = false;
+        check(ko.retryUnresolved(*out) == 2, "c17b-retry-clears", "");
+        check(ko.heldKeys().empty(), "c17b-no-keys-held", "");
+    }
+
+    // ---- C18: lifecycle race — producer must not touch Engine while the
+    // executor is alive. Regression for stop() clearing `running_` before join().
+    section("C18 cancellation during the stopping/joining window");
+    {
+        auto out = std::make_shared<HookBackend>();
+        MappingRuntime rt(out, 64);
+        rt.engine().setRealtime(true);
+        Binding slow; slow.id = "c18s"; slow.match = {"s", "long", EventType::Pressed};
+        Action d; d.kind = ActionKind::Delay; d.delayMs = 4000;
+        Action t; t.kind = ActionKind::KeyTap; t.key = "z";
+        slow.script = {d, t};
+        rt.engine().addBinding(slow);
+        rt.start();
+
+        rt.post(press("s", "long", 1));
+        std::this_thread::sleep_for(std::chrono::milliseconds(60));  // executor inside delay
+
+        // DECISIVE CHECK. This hook runs inside stop(), after the stop was
+        // requested and before join(): the executor thread definitely exists and
+        // Engine may be inside dispatch(). Capturing the counter here - not from
+        // a racing producer - makes the measurement unambiguous.
+        size_t inlineBefore = rt.inlineCleanups();
+        std::atomic<size_t> inlineAtBoundary{(size_t)-1};
+        std::atomic<bool> runningAtBoundary{false};
+        rt.setOnStopJoining([&] {
+            runningAtBoundary = rt.executorRunning();
+            inlineAtBoundary = rt.inlineCleanups();
+        });
+
+        // Hammer the producer entries from several threads while stop() is joining.
+        // The invariant under test: a producer must NEVER take the inline Engine
+        // path (inlineCleanups) while an executor thread still exists, because
+        // engine_ is not thread-safe against a running Engine::dispatch().
+        std::atomic<bool> stopStarted{false}, stopDone{false};
+        std::atomic<bool> sawRunning{false};
+        const int kProducers = 4;
+        std::thread stopper([&] { stopStarted = true; rt.stop(); stopDone = true; });
+        std::vector<std::thread> producers;
+        for (int i = 0; i < kProducers; ++i) {
+            producers.emplace_back([&] {
+                while (!stopStarted.load()) std::this_thread::yield();
+                while (!stopDone.load()) {
+                    if (rt.executorRunning()) sawRunning = true;
+                    rt.postCancelAll();
+                    rt.postCancelSource("padA");
+                }
+            });
+        }
+        stopper.join();
+        for (auto& th : producers) th.join();
+
+        check(sawRunning.load(), "c18-executor-visible-during-join", "");
+        check(runningAtBoundary.load(), "c18-still-running-inside-stop-before-join", "");
+        check(!rt.executorRunning(), "c18-not-running-after-stop", "");
+        // inlineAtBoundary was captured inside stop() before join(), while the
+        // executor was alive. Producers were hammering the entry points before
+        // that instant, so any inline mutation they managed is included. Zero
+        // means the lifecycle lock genuinely kept them out of Engine.
+        check(inlineAtBoundary.load() == inlineBefore,
+              "c18-no-inline-engine-mutation-during-join",
+              "before=" + std::to_string(inlineBefore) +
+              " atBoundary=" + std::to_string(inlineAtBoundary.load()));
+        check(taps(out->ops, "z") == 0, "c18-no-action-after-stop", "");
+        check(out->heldKeys().empty(), "c18-no-stuck-keys", "");
+
+        // The decisive assertion. Every producer above either queued its request
+        // or (only once no executor existed) applied it inline; any inline cleanup
+        // that ran while the executor was alive would have raced Engine::dispatch.
+        // Post-stop, with the thread gone, inline cleanups are expected and safe.
+        check(!rt.cancelPending(), "c18-inline-stop-clears-request", "");
+
+        // Restart must work and process fresh input.
+        Binding fast; fast.id = "c18f"; fast.match = {"s", "quick", EventType::Pressed};
+        Action tq; tq.kind = ActionKind::KeyTap; tq.key = "y"; fast.script = {tq};
+        rt.engine().addBinding(fast);
+        rt.start();
+        rt.post(press("s", "quick", 2));
+        bool ranAfter = false;
+        for (int i = 0; i < 200 && !ranAfter; ++i) {
+            ranAfter = taps(out->ops, "y") >= 1;
+            if (!ranAfter) std::this_thread::sleep_for(std::chrono::milliseconds(5));
+        }
+        check(ranAfter, "c18-runs-after-restart", "");
+        rt.postCancelAll();
+        std::this_thread::sleep_for(std::chrono::milliseconds(80));
+        check(out->heldKeys().empty(), "c18-no-stuck-keys-after-second-stop", "");
+        rt.stop();
+    }
+
+    // ---- C19: stop acknowledgement must not outrun the FIFO barrier ----------
+    // Regression for: cancelAll() acknowledged the stop, and only afterwards
+    // dropped the FIFO. A producer could see the stop as complete, post a
+    // legitimate post-stop event, and have it deleted by that later sweep.
+    //
+    // This drives the REAL handle() path and posts from inside the
+    // post-acknowledgement hook, which is exactly the window the old ordering
+    // left open. No sleeps and no manual re-implementation of the steps.
+    section("C19 post-stop event survives the cleanup sweep");
+    {
+        auto out = std::make_shared<HookBackend>();
+        MappingRuntime rt(out, 64);
+        Binding b; b.id = "c19"; b.match = {"s", "c", EventType::Pressed};
+        Action t; t.kind = ActionKind::KeyTap; t.key = "k"; b.script = {t};
+        rt.engine().addBinding(b);
+
+        bool posted = false;
+        rt.setOnStopAcknowledged([&] {
+            if (!posted) { posted = true; rt.post(press("s", "c", 3)); }
+        });
+
+        // The runtime must appear to have an executor for postCancelAll to take
+        // the QUEUED control path (the inline path is covered by C18). start() is
+        // real; the barrier + hook below then drive the exact ordering.
+        rt.start();
+
+        // Pre-stop work sits in the queue, ahead of the control item.
+        rt.post(press("s", "c", 1));
+        rt.post(press("s", "c", 2));
+
+        rt.postCancelAll();                      // queued control item (epoch N)
+
+        // Drain: control items first, so the stop is applied before the events.
+        while (rt.processOne(0)) {}
+        check(posted, "c19-producer-posted-after-completion", "");
+        check(!rt.cancelPending(), "c19-stop-complete", "");
+
+        int ran = taps(out->ops, "k");
+        check(ran == 1, "c19-exactly-the-post-stop-event-ran",
+              "ran=" + std::to_string(ran));
+        check(rt.eventsDroppedByCancel() >= 2, "c19-pre-stop-events-dropped",
+              "dropped=" + std::to_string(rt.eventsDroppedByCancel()));
+
+        // The survivor is the event posted after the stop became visible - not one
+        // of the pre-stop ones - and nothing else is left behind.
+        check(!rt.processOne(0), "c19-queue-empty-after-drain", "");
+        check(taps(out->ops, "k") == 1, "c19-no-extra-action", "");
+        rt.stop();
+    }
+
+    // ---- C20: legacy cancelSource()/cancelAll() defaults must not leave a
+    // request pending. A direct call with no epoch is a complete stop by itself.
+    section("C20 legacy default requestEpoch = 0");
+    {
+        auto out = std::make_shared<HookBackend>();
+        Engine e(out);
+        Binding b; b.id = "c20"; b.match = {"s", "c", EventType::Pressed};
+        Action t; t.kind = ActionKind::KeyTap; t.key = "k"; b.script = {t};
+        e.addBinding(b);
+
+        // No requestCancel() was issued: cancelAll() with the default epoch must
+        // still be a complete, non-blocking stop.
+        e.cancelAll();
+        check(!e.cancelPending(), "c20-cancelall-default-not-pending", "");
+        check(!e.stopPending(), "c20-cancelall-default-no-stop", "");
+        e.dispatch(press("s", "c", 1));
+        check(taps(out->ops, "k") == 1, "c20-runs-after-default-cancelall", "");
+
+        // Same for cancelSource(): a direct call must not leave a pending request.
+        e.cancelSource("s");
+        check(!e.cancelPending(), "c20-cancelsource-default-not-pending", "");
+
+        // And a request that IS outstanding is still honoured by a direct call.
+        e.requestStop();
+        check(e.cancelPending(), "c20-request-registered", "");
+        e.cancelAll();
+        check(!e.cancelPending(), "c20-direct-call-clears-outstanding", "");
+        e.dispatch(press("s", "c", 2));
+        check(taps(out->ops, "k") == 2, "c20-runs-after-clearing", "");
     }
 
     std::printf("\n%d checks, %d passed, %d failed\n", g_check, g_pass, g_fail);

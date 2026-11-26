@@ -188,12 +188,21 @@ bool KeyOwnership::release(const std::string& key, const std::string& holder, Ou
     if (hIt == perHolder_.end() || hIt->second == 0) return false;
     hIt->second = 0;
     auto keyIt = keyRefs_.find(key);
-    if (keyIt != keyRefs_.end() && --keyIt->second <= 0) {
-        keyRefs_.erase(keyIt);
-        if (!out.keyUp(key)) { ++outputFailures_; return false; } // physical down->up failed
-        return true;
+    if (keyIt == keyRefs_.end()) return false;
+    if (--keyIt->second > 0) return false;      // still held by another holder
+    // Last holder: attempt the physical up. If the backend refuses, the key may
+    // still be physically down, so the ownership entry is KEPT and the key is
+    // recorded as unresolved. Erasing it here would discard the only record of a
+    // key that might still be held, and nothing could ever retry the release.
+    if (!out.keyUp(key)) {
+        ++outputFailures_;
+        unresolved_[key]++;
+        keyIt->second = 1;                      // stays tracked: still logically down
+        return false;
     }
-    return false;
+    unresolved_.erase(key);
+    keyRefs_.erase(keyIt);
+    return true;
 }
 void KeyOwnership::releaseAllByHolder(const std::string& holder, OutputBackend& out) {
     for (auto it = perHolder_.begin(); it != perHolder_.end();) {
@@ -201,8 +210,16 @@ void KeyOwnership::releaseAllByHolder(const std::string& holder, OutputBackend& 
             it->second = 0;
             auto keyIt = keyRefs_.find(it->first.first);
             if (keyIt != keyRefs_.end() && --keyIt->second <= 0) {
-                keyRefs_.erase(keyIt);
-                if (!out.keyUp(it->first.first)) ++outputFailures_;
+                if (!out.keyUp(it->first.first)) {
+                    // Same rule as release(): a refused physical up keeps the key
+                    // tracked and recorded so a later sweep can retry it.
+                    ++outputFailures_;
+                    unresolved_[it->first.first]++;
+                    keyIt->second = 1;
+                } else {
+                    unresolved_.erase(it->first.first);
+                    keyRefs_.erase(keyIt);
+                }
             }
             ++it;
         } else {
@@ -211,10 +228,46 @@ void KeyOwnership::releaseAllByHolder(const std::string& holder, OutputBackend& 
     }
 }
 void KeyOwnership::releaseAll(OutputBackend& out) {
-    for (auto& kv : keyRefs_) out.keyUp(kv.first);
-    keyRefs_.clear();
+    // Emergency sweep. A key whose up is refused stays tracked and unresolved:
+    // the caller can observe it (unresolvedKeys()) and retry, and the state still
+    // reflects that the key may be physically down.
+    for (auto it = keyRefs_.begin(); it != keyRefs_.end();) {
+        if (out.keyUp(it->first)) {
+            unresolved_.erase(it->first);
+            it = keyRefs_.erase(it);
+        } else {
+            ++outputFailures_;
+            unresolved_[it->first]++;
+            ++it;
+        }
+    }
     perHolder_.clear();
+    // The backend's own all-keys sweep is still attempted, but its result is not
+    // reported as success for keys that remain unresolved above.
     out.releaseAll();
+}
+bool KeyOwnership::isUnresolved(const std::string& key) const {
+    return unresolved_.find(key) != unresolved_.end();
+}
+std::vector<std::string> KeyOwnership::unresolvedKeys() const {
+    std::vector<std::string> v;
+    for (const auto& kv : unresolved_) v.push_back(kv.first);
+    std::sort(v.begin(), v.end());
+    return v;
+}
+size_t KeyOwnership::retryUnresolved(OutputBackend& out) {
+    size_t resolved = 0;
+    for (auto it = unresolved_.begin(); it != unresolved_.end();) {
+        if (out.keyUp(it->first)) {
+            keyRefs_.erase(it->first);
+            it = unresolved_.erase(it);
+            ++resolved;
+        } else {
+            ++outputFailures_;
+            ++it;
+        }
+    }
+    return resolved;
 }
 bool KeyOwnership::isHeld(const std::string& key) const {
     return keyRefs_.find(key) != keyRefs_.end();
@@ -313,8 +366,11 @@ private:
         in.type = INPUT_KEYBOARD;
         in.ki.wVk = vk;
         if (up) in.ki.dwFlags = KEYEVENTF_KEYUP;
-        SendInput(1, &in, sizeof(INPUT));
-        return true;
+        // Check what Windows actually accepted. SendInput returns how many INPUT
+        // structures it inserted; 0 means UIPI blocked it or the queue was full.
+        // Reporting true regardless left KeyOwnership believing a key had been
+        // released while the OS never saw the event.
+        return SendInput(1, &in, sizeof(INPUT)) == 1;
     }
 };
 

@@ -34,6 +34,7 @@ bool EventQueue::post(const Event& ev, uint64_t postedStopEpoch) {
     item.kind = QueueItemKind::Event;
     item.ev = ev;
     item.postedStopEpoch = postedStopEpoch;
+    item.seq = ++postSeq_;              // assigned under mu_: the linearization point
     fifo_.push_back(item);
     cv_.notify_one();
     return !droppedSomething;
@@ -131,6 +132,31 @@ size_t EventQueue::dropPendingEvents() {
     return n;
 }
 
+size_t EventQueue::applyStopBarrier() {
+    // The barrier and the enqueue sequence are both taken under mu_, so the
+    // order between "this event was enqueued" and "this stop was applied" is a
+    // total order with no gap. An event whose seq is <= the barrier was queued
+    // before the stop took effect and is erased. An event enqueued afterwards,
+    // including one from a producer that was still inside its own post() call,
+    // has a higher seq and is preserved. No engine state is consulted, so a
+    // producer cannot make its own event look post-stop by reading stale state.
+    size_t n = 0;
+    uint64_t barrier = 0;
+    {
+        std::lock_guard<std::mutex> lk(mu_);
+        barrier = postSeq_;
+        for (auto it = fifo_.begin(); it != fifo_.end();) {
+            if (it->kind == QueueItemKind::Event && it->seq <= barrier) {
+                it = fifo_.erase(it);
+                ++n;
+            } else {
+                ++it;
+            }
+        }
+    }
+    return n;
+}
+
 size_t EventQueue::dropped() const {
     std::lock_guard<std::mutex> lk(mu_);
     return dropped_;
@@ -152,76 +178,113 @@ MappingRuntime::MappingRuntime(std::shared_ptr<OutputBackend> out, size_t maxQue
 
 MappingRuntime::~MappingRuntime() { stop(); }
 
+// Lifecycle and lock order:
+//
+//   lifeMu_  ->  queue mutex (EventQueue::mu_)  ->  engine (no lock)
+//
+//   * lifeMu_ is held for the whole start()/stop() transition and by a producer
+//     only while it decides (and, if there is no executor, performs) an inline
+//     cleanup. That is what makes "no executor thread exists" a fact a producer
+//     can rely on: stop() cannot be midway through joining while a producer holds
+//     it, because stop() needs it to join.
+//   * Neither the executor nor engine_ ever takes lifeMu_, so it cannot invert.
+//   * No blocking output call is made while holding the queue mutex; engine_
+//     work happens outside it.
 bool MappingRuntime::start() {
+    std::lock_guard<std::mutex> life(lifeMu_);
     if (running_) return true;
     // A previous stop() shut the queue down; without re-arming it the executor
     // would spin through pops that always return false and never process input.
     queue_.reopen();
-    running_ = true;
+    stopRequested_ = false;
+    running_ = true;          // a thread exists from here until join() completes
     executor_ = std::thread([this] { loop(); });
     return true;
 }
 
 void MappingRuntime::stop() {
+    std::unique_lock<std::mutex> life(lifeMu_);
     if (!running_) return;
-    running_ = false;
+    // Tell the LOOP to exit, but keep running_ true: a producer that sees
+    // running_ == false must be able to conclude no executor exists. Clearing it
+    // before join() let a producer take the inline-cleanup path and touch engine_
+    // while the executor was still inside Engine::dispatch().
+    stopRequested_ = true;
     engine_.requestCancel();  // interrupt a long delay/repeat so join() is prompt
     queue_.shutdown();
+    // Test-only: at this instant the executor is still alive and running_ is
+    // still true, which is exactly the window the lifecycle fix is about.
+    if (onStopJoining_) onStopJoining_();
     if (executor_.joinable()) executor_.join();
-    // The executor's final cancelAll() is a full stop: acknowledge whatever was
-    // requested so a restarted runtime is not immediately blocked by it.
+    running_ = false;         // executor is gone (joined): only now is that true
+    // Final sweep, now that the executor cannot touch engine_ concurrently.
     engine_.cancelAll();
-    // Shutdown is a stop too: work that was queued but never ran must not fire
-    // after a restart as if it had just arrived.
+    // Shutdown is a stop too: work queued but never run must not fire after a
+    // restart as if it had just arrived.
     size_t discarded = queue_.dropPendingEvents();
     if (discarded) eventsDroppedByCancel_.fetch_add(discarded);
 }
+
 void MappingRuntime::post(const Event& ev) {
     // Stamp the event with the stop that is in force at post time (0 if none).
-    // The executor discards an event whose stamp refers to a stop it has already
-    // applied, so "actions queued before the stop do not run" holds without
-    // guessing from arrival order; an event posted once the stop completed has no
-    // stamp and is dispatched normally (a later legitimate action still runs).
+    // The stamp is only a hint for diagnostics; the authoritative pre/post-stop
+    // decision is the enqueue sequence compared against the stop barrier inside
+    // EventQueue, so a producer cannot be fooled by reading stale stop state.
     queue_.post(ev, engine_.pendingStopEpoch());
 }
 
-// Emergency-stop path. Ordering matters and is deliberate:
+// Emergency-stop path. Ordering is deliberate:
 //
 //  1. Publish the request (epoch + stop epoch + flag) FIRST. This is what stops
 //     an executing synchronous dispatch, which a queued control item cannot
-//     interrupt at all: the executor is inside the engine, not at the queue.
-//  2. Queue the priority control item carrying the epoch, so the executor also
-//     performs the key release and acknowledges the request.
-//  3. If no executor is running (single-threaded callers, or a runtime between
-//     start() calls), nobody would ever pop that item, so the request is
-//     acknowledged here instead - otherwise the runtime would stay blocked
-//     forever and no later action could run.
-//
-// The epoch travels with the item, so a burst of stops collapses into one
-// acknowledgement without losing the newest request, and a replay of a stop whose
-// cleanup already ran is skipped rather than repeated.
+//     interrupt: the executor is inside the engine, not at the queue.
+//  2. Queue the priority control item carrying the epoch, so the executor
+//     performs the key release, applies the FIFO barrier, and acknowledges.
+//  3. If no executor exists, nobody would ever pop that item. That decision is
+//     taken under lifeMu_, together with stop()'s transition, so a producer can
+//     never run the inline cleanup while an executor is still alive.
 void MappingRuntime::postCancelSource(const std::string& source) {
     const uint64_t epoch = engine_.requestCancel();
-    if (running_.load()) { queue_.postCancelSource(source, epoch); return; }
-    engine_.cancelSource(source, epoch);
-    queue_.dropPendingControl();
+    {
+        std::lock_guard<std::mutex> life(lifeMu_);
+        if (!running_) {
+            inlineCleanups_.fetch_add(1);
+            engine_.cancelSource(source, epoch);
+            queue_.dropPendingControl();
+            return;
+        }
+    }
+    queue_.postCancelSource(source, epoch);
 }
 void MappingRuntime::postCancelAll() {
-    // The stop epoch is captured BEFORE the flag is published, so events posted
-    // from here on carry a stamp that identifies them as pre-stop work.
     const uint64_t epoch = engine_.requestStop();
-    if (running_.load()) { queue_.postCancelAll(epoch); return; }
-    // No executor to pop the item: acknowledge here and discard what was queued.
-    engine_.cancelAll(epoch);
-    queue_.dropPendingControl();
-    size_t discarded = queue_.dropPendingEvents();
-    if (discarded) eventsDroppedByCancel_.fetch_add(discarded);
+    {
+        std::lock_guard<std::mutex> life(lifeMu_);
+        if (!running_) {
+            inlineCleanups_.fetch_add(1);
+            // No executor: apply cleanup and acknowledgement as one step, with
+            // the FIFO barrier taken before the stop becomes visible as complete.
+            engine_.cancelAll(epoch);
+            queue_.dropPendingControl();
+            size_t discarded = queue_.applyStopBarrier();
+            if (discarded) eventsDroppedByCancel_.fetch_add(discarded);
+            return;
+        }
+    }
+    queue_.postCancelAll(epoch);
 }
 void MappingRuntime::postDeviceRemoved(const std::string& source) {
     const uint64_t epoch = engine_.requestCancel();
-    if (running_.load()) { queue_.postDeviceRemoved(source, epoch); return; }
-    engine_.cancelSource(source, epoch);
-    queue_.dropPendingControl();
+    {
+        std::lock_guard<std::mutex> life(lifeMu_);
+        if (!running_) {
+            inlineCleanups_.fetch_add(1);
+            engine_.cancelSource(source, epoch);
+            queue_.dropPendingControl();
+            return;
+        }
+    }
+    queue_.postDeviceRemoved(source, epoch);
 }
 
 void MappingRuntime::loop() {
@@ -231,7 +294,7 @@ void MappingRuntime::loop() {
             std::chrono::steady_clock::now().time_since_epoch()).count();
     };
     uint64_t lastTick = nowMs();
-    while (running_) {
+    while (!stopRequested_) {
         if (!queue_.pop(it, 20)) {
             // idle: drive time-based triggers (HoldRepeat / LongPress)
             engine_.tick(nowMs());
@@ -251,15 +314,10 @@ void MappingRuntime::loop() {
 void MappingRuntime::handle(const QueueItem& it) {
     switch (it.kind) {
     case QueueItemKind::Event:
-        // An event posted while an emergency stop was in force belongs to the
-        // pre-stop world: CancelAll semantics say it does not run. Legitimate
-        // input posted after the stop completed carries no stamp.
-        if (it.postedStopEpoch && engine_.cancelAcknowledged(it.postedStopEpoch)) {
-            eventsDroppedByCancel_.fetch_add(1);
-            break;
-        }
-        // No local stop guard here: Engine::dispatch() is the single place that
-        // decides what a pending stop blocks, so the two cannot drift apart.
+        // CancelAll semantics are enforced by the queue barrier at stop time, so
+        // an event still in the FIFO is either genuinely after the stop or was
+        // posted while it was in flight; in the latter case the engine's own
+        // stopPending() gate refuses it. No local stamp test here.
         engine_.dispatch(it.ev);
         break;
     case QueueItemKind::CancelSource:
@@ -269,22 +327,29 @@ void MappingRuntime::handle(const QueueItem& it) {
         if (it.cancelEpoch && engine_.cancelAcknowledged(it.cancelEpoch)) break;
         engine_.cancelSource(it.source, it.cancelEpoch);
         break;
-    case QueueItemKind::CancelAll: {
-        if (it.cancelEpoch && engine_.cancelAcknowledged(it.cancelEpoch)) {
-            // Replay of a stop whose cleanup already ran (e.g. a control item left
-            // over from a previous run, or two producers racing). Performing it
-            // again would delete key state and queued input that a later, already
-            // accepted action legitimately owns, so it is a no-op.
-            break;
+    case QueueItemKind::CancelAll:
+        // Replay of a stop whose cleanup already ran (a control item left over
+        // from a previous run, or two producers racing) must not wipe key state
+        // that a later, already accepted action legitimately owns.
+        if (it.cancelEpoch && engine_.cancelAcknowledged(it.cancelEpoch)) break;
+        // Ordering inside a step is load bearing:
+        //   1. release every key and clear every trigger;
+        //   2. take the FIFO barrier, dropping events enqueued before this point;
+        //   3. ONLY THEN acknowledge, which is what makes the stop observably
+        //      "complete" to producers.
+        // Acknowledging before the barrier let a producer see the stop as done,
+        // post a legitimate event, and lose it to the sweep that ran afterwards.
+        engine_.cancelAll(0);                      // (1) engine-side release only
+        {
+            size_t discarded = queue_.applyStopBarrier();   // (2)
+            if (discarded) eventsDroppedByCancel_.fetch_add(discarded);
         }
-        engine_.cancelAll(it.cancelEpoch);
-        // CancelAll semantics: everything still queued was posted before this
-        // stop was applied, so none of it may run. Events posted from now on carry
-        // this epoch and are discarded individually if they race the stop.
-        size_t discarded = queue_.dropPendingEvents();
-        if (discarded) eventsDroppedByCancel_.fetch_add(discarded);
+        engine_.acknowledgeStop(it.cancelEpoch);   // (3) now visibly complete
+        // Test-only: a producer that reacts to completion by posting an event
+        // does so here, i.e. immediately after the stop is externally visible and
+        // before this handler returns. It must never be deleted afterwards.
+        if (onStopAcked_) onStopAcked_();
         break;
-    }
     case QueueItemKind::DeviceRemoved:
         if (it.cancelEpoch && engine_.cancelAcknowledged(it.cancelEpoch)) break;
         engine_.cancelSource(it.source, it.cancelEpoch);

@@ -665,16 +665,28 @@ void Engine::cancelSource(const std::string& source, uint64_t requestEpoch) {
     if (requestEpoch) acknowledgeCancel(covered);
 }
 
-void Engine::cancelAll(uint64_t requestEpoch) {
-    // Snapshot BEFORE the cleanup: see cancelSource(). Reading after the release
-    // would acknowledge a request whose keys were never released.
-    const uint64_t covered = requestEpoch ? requestEpoch
-                                          : cancelEpoch_.load(std::memory_order_acquire);
+void Engine::releaseAllKeys() {
     ownership_.releaseAll(*out_);
     for (auto& kv : controls_) { kv.second.above = false; kv.second.toggle = false; }
     // Every trigger latch is invalid after an emergency stop: without this,
     // a stale held=true would make tick() re-fire LongPress/HoldRepeat.
     triggerStates_.clear();
+}
+
+void Engine::acknowledgeStop(uint64_t epoch) {
+    // Global cleanup is a superset of every earlier request, so the whole prefix
+    // is complete. Kept separate from releaseAllKeys() so the caller can put the
+    // queue barrier in between: until this runs, producers still see the stop as
+    // pending and therefore cannot post an event that the barrier would miss.
+    acknowledgeCancelThrough(epoch);
+}
+
+void Engine::cancelAll(uint64_t requestEpoch) {
+    // Snapshot BEFORE the cleanup: see cancelSource(). Reading after the release
+    // would acknowledge a request whose keys were never released.
+    const uint64_t covered = requestEpoch ? requestEpoch
+                                          : cancelEpoch_.load(std::memory_order_acquire);
+    releaseAllKeys();
     // Releasing every key and clearing every trigger is a superset of whatever any
     // earlier pending request needed, so the whole prefix up to `covered` is done.
     acknowledgeCancelThrough(covered);
@@ -710,6 +722,8 @@ uint64_t Engine::requestStop() {
 }
 
 std::vector<std::string> Engine::heldKeys() const { return ownership_.heldKeys(); }
+std::vector<std::string> Engine::unresolvedKeyReleases() const { return ownership_.unresolvedKeys(); }
+size_t Engine::retryUnresolvedReleases() { return ownership_.retryUnresolved(*out_); }
 size_t Engine::outputFailures() const { return ownership_.outputFailures(); }
 
 double Engine::lastValue(const std::string& source, const std::string& control) const {

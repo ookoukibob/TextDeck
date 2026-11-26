@@ -167,6 +167,12 @@ public:
 
     void cancelSource(const std::string& source, uint64_t requestEpoch = 0); // device disconnect
     void cancelAll(uint64_t requestEpoch = 0);                              // emergency stop
+    // Split forms, for callers that must order cleanup before making the stop
+    // externally visible. releaseAllKeys() releases every key and clears trigger
+    // latches but acknowledges nothing; acknowledgeStop(epoch) then publishes
+    // completion. The executor uses this so the FIFO barrier sits between them.
+    void releaseAllKeys();
+    void acknowledgeStop(uint64_t epoch);
     // Async, any thread. requestCancel() interrupts a running script (used by a
     // single device disconnect); requestStop() also forbids any NEW action from
     // starting (emergency stop). Both return the epoch that identifies the
@@ -196,6 +202,13 @@ public:
     void setRealtime(bool r) { realtime_ = r; }
 
     std::vector<std::string> heldKeys() const;
+    // Keys whose physical KeyUp the backend refused. They stay tracked (see
+    // KeyOwnership::unresolvedKeys) so an emergency sweep can report and retry
+    // them instead of silently forgetting a key that may still be down.
+    std::vector<std::string> unresolvedKeyReleases() const;
+    size_t unresolvedReleaseCount() const { return ownership_.unresolvedCount(); }
+    // Retry unresolved physical releases once; returns how many were resolved.
+    size_t retryUnresolvedReleases();
     // Output transitions the backend refused (unknown key / device missing).
     // Observable so callers never mistake a failed send for a successful one.
     size_t outputFailures() const;

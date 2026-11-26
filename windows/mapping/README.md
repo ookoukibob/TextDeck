@@ -132,8 +132,53 @@ Rules the implementation holds:
   inline (nothing would ever pop the item).
 - Actions queued before an applied stop are discarded and counted
   (`eventsDroppedByCancel()`); actions posted after it completes run normally.
+  The boundary is a queue-level **enqueue sequence**: `post()` takes its sequence
+  number under the queue mutex and a stop takes a barrier under that same mutex,
+  so an event is unambiguously before or after the stop. No engine state is read
+  to decide it, which is what keeps a producer that is mid-`post()` safe.
 - Replaying a stop whose cleanup already ran is a no-op, so a duplicate control
   item cannot wipe the key state of a later, accepted action.
+
+### Runtime lifecycle
+
+`MappingRuntime` distinguishes two facts that must not be conflated:
+
+| Flag | Meaning |
+|---|---|
+| `stopRequested_` | the executor loop must exit (set before `join()`) |
+| `running_` | an executor thread exists (true until `join()` completes) |
+
+A producer may only mutate `Engine` inline (the "no executor" fast path) when
+`running_` is false, which by construction means the thread is gone. `stop()` and
+`start()` hold the lifecycle mutex across the whole transition, so the inline
+decision cannot be evaluated while a join is in progress.
+
+Lock order: `lifeMu_` -> queue mutex -> engine. Neither the executor nor `Engine`
+ever takes `lifeMu_`, so the order cannot invert. No blocking output call is made
+while holding the queue mutex.
+
+### Stop ordering (linearization point)
+
+Inside one stop step the executor does exactly this, in this order:
+
+1. release every key and clear every trigger latch;
+2. take the queue barrier, dropping events enqueued at or before it;
+3. only then acknowledge the stop, which is what makes it externally "complete".
+
+Acknowledging before step 2 let a producer observe completion, post a legitimate
+event, and lose it to the sweep that ran afterwards. The no-executor path in
+`postCancelAll()` uses the same three-step order.
+
+### Output release accounting
+
+`SendInputBackend::send()` checks the value returned by `SendInput()`. A physical
+KeyUp that Windows did not accept is reported as a failure, and
+`KeyOwnership::release()` keeps its bookkeeping entry: the key stays in
+`heldKeys()`, is recorded in `unresolvedKeys()`, and can be retried with
+`retryUnresolved()`. Emergency cleanup therefore reports unresolved releases
+instead of silently forgetting a key that might still be physically down.
+A `SendInput` success only means Windows accepted the INPUT structure; it is not a
+claim about what the target application did.
 
 ## Limitations
 
