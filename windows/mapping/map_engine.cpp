@@ -2,6 +2,7 @@
 // JSON profile loader. (The concrete adapters are header-only in map_engine.h.)
 #include "map_engine.h"
 
+#include <algorithm>
 #include <chrono>
 #include <thread>
 
@@ -194,8 +195,115 @@ bool Engine::match(const Binding& b, const Event& e) const {
     return true;
 }
 
+bool Engine::ackCoveredLocked(uint64_t epoch) const {
+    // Caller holds cancelTrackMu_ (or passes a snapshot it already owns).
+    if (epoch == 0) return true;                       // "no request" is trivially done
+    if (epoch <= cancelAcked_.load(std::memory_order_acquire)) return true;
+    for (uint64_t e : ackOutOfOrder_) if (e == epoch) return true;
+    return false;
+}
+
+bool Engine::cancelAcknowledged(uint64_t epoch) const {
+    std::lock_guard<std::mutex> lk(cancelTrackMu_);
+    return ackCoveredLocked(epoch);
+}
+
+bool Engine::cancelPending() const {
+    // A cancel is outstanding while ANY accepted request is still unhandled.
+    // Checking only the newest epoch would hide an older request that is still
+    // pending behind a newer one that has already been cleaned up.
+    std::lock_guard<std::mutex> lk(cancelTrackMu_);
+    const uint64_t acked = cancelAcked_.load(std::memory_order_acquire);
+    const uint64_t head  = cancelEpoch_.load(std::memory_order_acquire);
+    if (head > acked) return true;                     // newest request not handled
+    for (uint64_t e : ackOutOfOrder_) if (e > acked) return true;
+    return false;
+}
+
+bool Engine::stopPending() const {
+    // A stop blocks new actions until ITS OWN epoch has been cleaned up. A newer
+    // per-device cancel being acknowledged must not unblock it; that is exactly
+    // the interleaving that a shared watermark got wrong.
+    std::lock_guard<std::mutex> lk(cancelTrackMu_);
+    const uint64_t stop = stopEpoch_.load(std::memory_order_acquire);
+    if (stop == 0) return false;
+    return !ackCoveredLocked(stop);
+}
+
+uint64_t Engine::pendingStopEpoch() const {
+    std::lock_guard<std::mutex> lk(cancelTrackMu_);
+    const uint64_t stop = stopEpoch_.load(std::memory_order_acquire);
+    if (stop == 0 || ackCoveredLocked(stop)) return 0;
+    return stop;
+}
+
+void Engine::foldAckedLocked() {
+    // Advance the watermark over every contiguously handled request. Requests
+    // handled ahead of a gap stay in ackOutOfOrder_ so the gap itself stays
+    // visibly pending: folding them wholesale is precisely the bug that let a
+    // newer cancel "acknowledge" an older, never-executed stop.
+    uint64_t next = cancelAcked_.load(std::memory_order_acquire) + 1;
+    while (true) {
+        auto it = std::lower_bound(ackOutOfOrder_.begin(), ackOutOfOrder_.end(), next);
+        if (it == ackOutOfOrder_.end() || *it != next) break;
+        ackOutOfOrder_.erase(it);
+        ++next;
+    }
+    if (next - 1 > cancelAcked_.load(std::memory_order_acquire)) {
+        cancelAcked_.store(next - 1, std::memory_order_acq_rel);
+    }
+    const uint64_t covered = cancelAcked_.load(std::memory_order_acquire);
+    ackOutOfOrder_.erase(
+        std::remove_if(ackOutOfOrder_.begin(), ackOutOfOrder_.end(),
+                       [covered](uint64_t e) { return e <= covered; }),
+        ackOutOfOrder_.end());
+}
+
+void Engine::acknowledgeCancel(uint64_t epoch) {
+    // Record exactly one request as handled. Contiguous ones advance the
+    // watermark; a request handled ahead of a gap is remembered individually and
+    // leaves the gap pending.
+    if (epoch == 0) return;
+    std::lock_guard<std::mutex> lk(cancelTrackMu_);
+    if (epoch > cancelAcked_.load(std::memory_order_acquire)) {
+        if (!ackCoveredLocked(epoch)) {
+            ackOutOfOrder_.push_back(epoch);
+            std::sort(ackOutOfOrder_.begin(), ackOutOfOrder_.end());
+        }
+        foldAckedLocked();
+    }
+    // The flag is purely diagnostic: clear it only when nothing at all is pending.
+    const uint64_t acked = cancelAcked_.load(std::memory_order_acquire);
+    bool anyPending = cancelEpoch_.load(std::memory_order_acquire) > acked;
+    for (uint64_t e : ackOutOfOrder_) if (e > acked) { anyPending = true; break; }
+    if (!anyPending) cancelRequested_.store(false, std::memory_order_release);
+}
+
+void Engine::acknowledgeCancelThrough(uint64_t epoch) {
+    // A global cleanup handled everything that was pending when it ran, so every
+    // request up to `epoch` is complete - including requests that a scoped
+    // cancelSource had cleaned up out of order.
+    if (epoch == 0) return;
+    std::lock_guard<std::mutex> lk(cancelTrackMu_);
+    uint64_t prev = cancelAcked_.load(std::memory_order_acquire);
+    while (prev < epoch &&
+           !cancelAcked_.compare_exchange_weak(prev, epoch,
+                                               std::memory_order_acq_rel,
+                                               std::memory_order_acquire)) {
+    }
+    foldAckedLocked();
+    const uint64_t acked = cancelAcked_.load(std::memory_order_acquire);
+    bool anyPending = cancelEpoch_.load(std::memory_order_acquire) > acked;
+    for (uint64_t e : ackOutOfOrder_) if (e > acked) { anyPending = true; break; }
+    if (!anyPending) cancelRequested_.store(false, std::memory_order_release);
+}
+
 void Engine::dispatch(const Event& e) {
-    cancelRequested_.store(false); // consume any stale cancel; real mid-run cancels still work
+    // Never blind-reset cancellation state here. A request that lands just before
+    // this call is a legitimate emergency stop and MUST NOT be erased by a
+    // dispatch that is only now starting; it is cleared only by the executor's
+    // acknowledgement. An outstanding stop blocks the whole dispatch.
+    if (stopPending()) return;  // guarantee 1: no new action once a stop is accepted
     if (e.ts != 0) now_ = e.ts;
     for (const Binding& b : activeBindings_()) {
         if (!match(b, e)) continue;
@@ -207,6 +315,8 @@ void Engine::dispatch(const Event& e) {
                 continue;
             st.lastEventTs = e.ts;
         }
+        // A stop can also arrive between two matching rules of one dispatch.
+        if (stopPending()) break;
         handle(b, e);
     }
 }
@@ -384,6 +494,10 @@ void Engine::handle(const Binding& b, const Event& e) {
 
 void Engine::tick(uint64_t nowMs) {
     now_ = nowMs;
+    // A time-based trigger must not fire a script while a stop is unacknowledged;
+    // the latching state is left untouched so the trigger continues normally once
+    // the stop has been completed.
+    if (stopPending()) return;
     for (const Binding& b : activeBindings_()) {
         auto it = triggerStates_.find(b.id);
         if (it == triggerStates_.end()) continue;
@@ -414,10 +528,34 @@ void Engine::tick(uint64_t nowMs) {
 }
 
 void Engine::runScript(const std::vector<Action>& script, const std::string& holder, CancelState& cs) {
-    for (const Action& a : script) {
-        if (cs.cancelled || cancelRequested_.load()) break;
+    // Single choke point for every script entry (press, release, tick, nested
+    // blocks all funnel through here or runBlock), so cancellation is not
+    // re-implemented per action kind and cannot drift out of sync.
+    runBlock(script, holder, cs);
+    // An externally interrupted script never reaches its own KeyUp steps, so the
+    // keys it owns are dropped here. This is what keeps a cancelled chord from
+    // leaving a modifier logically pressed. An explicit cancel_sequence action
+    // only stops the script and deliberately leaves key state to its author.
+    if (cancelPending()) releaseCancelKeys(holder, cs);
+}
+
+bool Engine::runBlock(const std::vector<Action>& block, const std::string& holder, CancelState& cs) {
+    // Returns false as soon as a step refused to run, which is what stops a
+    // nested sequence from resuming after a cancelled Delay interrupted it.
+    for (const Action& a : block) {
+        if (cs.cancelled || cancelPending()) return false;
         runAction(a, holder, cs);
+        if (cs.cancelled || cancelPending()) return false; // post-step check: catches Delay text
     }
+    return true;
+}
+
+void Engine::releaseCancelKeys(const std::string& holder, CancelState& cs) {
+    // A cancelled script must not leave its own keys or the modifiers of a
+    // half-issued chord down. Ownership is refcounted, so releasing the script's
+    // holder only drops what that holder actually pressed.
+    ownership_.releaseAllByHolder(holder, *out_);
+    cs.cancelled = true;
 }
 
 bool Engine::evalCond(const std::string& cond) {
@@ -447,26 +585,42 @@ void Engine::runAction(const Action& a, const std::string& holder, CancelState& 
         ownership_.release(a.key, holder, *out_);
         break;
     case ActionKind::KeyCombo:
-        for (const auto& k : a.combo) ownership_.press(k, holder, *out_);
+        // Presses and releases are interleaved per key, so a cancellation that
+        // arrives mid-chord still unwinds every key this combo already pressed
+        // instead of leaving the tail of the chord held.
+        for (const auto& k : a.combo) {
+            if (cs.cancelled || cancelPending()) break;
+            ownership_.press(k, holder, *out_);
+        }
         for (auto it = a.combo.rbegin(); it != a.combo.rend(); ++it)
             ownership_.release(*it, holder, *out_);
         break;
-    case ActionKind::TypeText: out_->typeText(a.text); break;
+    case ActionKind::TypeText: {
+        // The backend polls this probe between characters and unwinds its own
+        // partial state; the engine only decides whether the script continues.
+        TextOutcome r = out_->typeText(a.text, [this] { return cancelPending(); });
+        if (r == TextOutcome::Cancelled) cs.cancelled = true;
+        else if (r == TextOutcome::Failed) ++textFailures_;   // reported, not swallowed
+        break;
+    }
     case ActionKind::Delay: sleepMs(a.delayMs); break;
     case ActionKind::Repeat:
-        for (int i = 0; i < a.count && !cs.cancelled && !cancelRequested_.load(); ++i) {
-            for (const auto& s : a.block) {
-                if (cs.cancelled || cancelRequested_.load()) break;
-                runAction(s, holder, cs);
-            }
+        for (int i = 0; i < a.count; ++i) {
+            if (!runBlock(a.block, holder, cs)) break;
         }
         break;
     case ActionKind::Conditional:
-        if (evalCond(a.cond)) {
-            for (const auto& s : a.block) { if (cs.cancelled) break; runAction(s, holder, cs); }
-        }
+        // Uses the same cancellation gate as every other nested block: the old
+        // code checked only cs.cancelled, so a cancel request that interrupted
+        // a nested Delay let the rest of the block run to completion.
+        if (evalCond(a.cond)) runBlock(a.block, holder, cs);
         break;
-    case ActionKind::ProfileSwitch: activateProfile(a.profile); break;
+    case ActionKind::ProfileSwitch:
+        // A cancellation must win over a profile change: switching profiles
+        // releases keys owned by the outgoing profile and clears trigger state,
+        // which would make an in-flight stop look like a normal transition.
+        if (!cs.cancelled && !cancelPending()) activateProfile(a.profile);
+        break;
     case ActionKind::CancelSequence: cs.cancelled = true; break;
     }
 }
@@ -476,14 +630,19 @@ void Engine::sleepMs(int ms) {
     if (!realtime_) return;
     int left = ms;
     while (left > 0) {
-        if (cancelRequested_.load()) return;   // interruptible delay
+        if (cancelPending()) return;   // interruptible delay
         int slice = left < 10 ? left : 10;
         std::this_thread::sleep_for(std::chrono::milliseconds(slice));
         left -= slice;
     }
 }
 
-void Engine::cancelSource(const std::string& source) {
+void Engine::cancelSource(const std::string& source, uint64_t requestEpoch) {
+    // Snapshot BEFORE the cleanup, never after: a request that arrives while this
+    // call is releasing keys is NOT covered by this cleanup and must stay pending
+    // until its own acknowledgement, otherwise its keys would never be released.
+    const uint64_t covered = requestEpoch ? requestEpoch
+                                          : cancelEpoch_.load(std::memory_order_acquire);
     for (const auto& p : profiles_) {
         for (const Binding& b : p.second) {
             if (b.match.source == source) {
@@ -498,22 +657,56 @@ void Engine::cancelSource(const std::string& source) {
         if (it->first.rfind(source + "|", 0) == 0) it = controls_.erase(it);
         else ++it;
     }
+    // A per-source stop is complete once that source's keys are released and its
+    // stale trigger state is gone. ONLY its own epoch is acknowledged: this sweep
+    // does not cover any other request (a global stop for an older epoch still
+    // owes a full releaseAll), so acknowledging a range here would unblock
+    // dispatch before the emergency release had run.
+    if (requestEpoch) acknowledgeCancel(covered);
 }
 
-void Engine::cancelAll() {
-    cancelRequested_.store(false);
+void Engine::cancelAll(uint64_t requestEpoch) {
+    // Snapshot BEFORE the cleanup: see cancelSource(). Reading after the release
+    // would acknowledge a request whose keys were never released.
+    const uint64_t covered = requestEpoch ? requestEpoch
+                                          : cancelEpoch_.load(std::memory_order_acquire);
     ownership_.releaseAll(*out_);
     for (auto& kv : controls_) { kv.second.above = false; kv.second.toggle = false; }
     // Every trigger latch is invalid after an emergency stop: without this,
     // a stale held=true would make tick() re-fire LongPress/HoldRepeat.
     triggerStates_.clear();
+    // Releasing every key and clearing every trigger is a superset of whatever any
+    // earlier pending request needed, so the whole prefix up to `covered` is done.
+    acknowledgeCancelThrough(covered);
 }
 
-void Engine::requestCancel() {
-    // Safe to call from any thread (producer/UI/emergency): only flips an atomic
-    // so a long `delay`/`repeat` script bails out early. The actual key release
-    // is performed by the executor via cancelAll()/cancelSource().
-    cancelRequested_.store(true);
+uint64_t Engine::requestCancel() {
+    // Safe to call from any thread (producer/UI/device teardown): only flips
+    // atomics so a long delay/repeat/type_text script bails out early. The actual
+    // key release is performed by the executor via cancelAll()/cancelSource().
+    //
+    // The epoch is bumped BEFORE the flag is published so a reader that sees
+    // cancelRequested_==true always sees a matching epoch; dispatch()/runBlock()
+    // consult the epoch, so a request arriving during dispatch initialization is
+    // still honoured and can never be erased by the dispatcher.
+    const uint64_t epoch = cancelEpoch_.fetch_add(1, std::memory_order_acq_rel) + 1;
+    cancelRequested_.store(true, std::memory_order_release);
+    return epoch;
+}
+
+uint64_t Engine::requestStop() {
+    // An emergency stop is a cancel plus "and do not start anything new". The
+    // stop epoch is published after the request epoch so no reader can see a stop
+    // without its cancel.
+    const uint64_t epoch = requestCancel();
+    // Monotonic max: two concurrent stops must not let the lower epoch win.
+    uint64_t prev = stopEpoch_.load(std::memory_order_acquire);
+    while (prev < epoch &&
+           !stopEpoch_.compare_exchange_weak(prev, epoch,
+                                             std::memory_order_acq_rel,
+                                             std::memory_order_acquire)) {
+    }
+    return epoch;
 }
 
 std::vector<std::string> Engine::heldKeys() const { return ownership_.heldKeys(); }

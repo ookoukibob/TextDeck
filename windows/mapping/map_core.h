@@ -65,6 +65,26 @@ const KeyInfo* FindKeyByVk(unsigned short vk); // reverse lookup, for Raw Input
 bool CharToStroke(char c, std::string& keyName, bool& needShift);
 
 // ---------------------------------------------------------------------------
+// Cancellation probe for long-running output operations.
+//
+// A backend must be able to stop between two safe input units (one character of
+// a type_text run) without learning anything about the rule engine: it is handed
+// a plain predicate that returns true once an emergency stop has been requested.
+// The predicate is polled synchronously by the backend; an empty probe means
+// "never cancellable" and is the default so short input paths stay unchanged.
+// ---------------------------------------------------------------------------
+using CancelProbe = std::function<bool()>;
+
+// Result of a text-injection run. Cancellation and refusal are distinct: a
+// cancelled run stopped on purpose at a safe point, a failed run hit a real
+// backend error, and both must be reportable without lying about the other.
+enum class TextOutcome : int {
+    Ok = 0,
+    Failed,
+    Cancelled,
+};
+
+// ---------------------------------------------------------------------------
 // Unified keyboard output. Every mapping action goes through this interface,
 // never through a device-specific sender.
 // ---------------------------------------------------------------------------
@@ -73,7 +93,11 @@ public:
     virtual ~OutputBackend() = default;
     virtual bool keyDown(const std::string& key) = 0;   // false = key unknown/unsupported
     virtual bool keyUp(const std::string& key) = 0;
-    virtual bool typeText(const std::string& text) = 0; // whole string, char by char
+    // Whole string, one character at a time. `cancelled` is polled between
+    // characters; a run that observes it must release whatever it pressed and
+    // return TextOutcome::Cancelled instead of finishing the string.
+    virtual TextOutcome typeText(const std::string& text,
+                                 const CancelProbe& cancelled = CancelProbe()) = 0;
     virtual bool releaseAll() = 0;                       // emergency: drop everything
     virtual const char* name() const = 0;
 };
@@ -85,7 +109,7 @@ public:
     std::vector<std::string> ops;          // e.g. "down:space", "up:space", "text:hi"
     bool keyDown(const std::string& key) override;
     bool keyUp(const std::string& key) override;
-    bool typeText(const std::string& text) override;
+    TextOutcome typeText(const std::string& text, const CancelProbe& cancelled = CancelProbe()) override;
     bool releaseAll() override;
     const char* name() const override { return "record"; }
     std::vector<std::string> heldKeys() const; // currently-down keys, sorted

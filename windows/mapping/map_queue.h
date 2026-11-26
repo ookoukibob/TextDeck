@@ -43,10 +43,19 @@ enum class QueueItemKind : int {
     DeviceRemoved,
 };
 
+// A control request carries the cancellation epoch it belongs to, so the
+// executor acknowledges exactly the requests it actually handled.
 struct QueueItem {
     QueueItemKind kind = QueueItemKind::Event;
     Event ev;
-    std::string source; // CancelSource / DeviceRemoved
+    std::string source;         // CancelSource / DeviceRemoved
+    uint64_t cancelEpoch = 0;   // epoch of the request this control item completes
+    // Event items only: the stop epoch in force when the event was posted. An
+    // event stamped with a stop that has since been applied belongs to the
+    // pre-stop world and is discarded; an unstamped one (0) was posted after the
+    // stop completed and runs normally. This is what distinguishes "queued before
+    // the emergency stop" from "arrived just after it" without timing guesses.
+    uint64_t postedStopEpoch = 0;
 };
 
 class EventQueue {
@@ -55,15 +64,28 @@ public:
 
     // Returns true if the event was accepted without dropping anything; false if
     // an older non-Released event had to be dropped to make room.
-    bool post(const Event& ev);
-    void postCancelSource(const std::string& source);   // priority, never dropped
-    void postCancelAll();                               // priority, never dropped
-    void postDeviceRemoved(const std::string& source);  // priority, never dropped
+    // `postedStopEpoch` stamps the event with the stop in force at post time (0 =
+    // none); the executor discards stamped events instead of running them after
+    // that stop has been applied.
+    bool post(const Event& ev, uint64_t postedStopEpoch = 0);
+    void postCancelSource(const std::string& source, uint64_t epoch = 0); // priority, never dropped
+    void postCancelAll(uint64_t epoch = 0);                              // priority, never dropped
+    void postDeviceRemoved(const std::string& source, uint64_t epoch = 0); // priority, never dropped
 
     // Blocking pop; processes CONTROL items first. Returns false on timeout or
     // after shutdown().
     bool pop(QueueItem& out, int timeoutMs);
     void shutdown();        // wake all waiters; subsequent pop() returns false
+    // Re-arm after shutdown() so a restarted MappingRuntime consumes items again
+    // instead of spinning on a permanent "false" from pop().
+    void reopen();
+    // Forget queued CancelAll/CancelSource/DeviceRemoved items: their requests
+    // were acknowledged by the caller, so replaying them would be a double stop.
+    size_t dropPendingControl();
+    // Discard queued Event items (control requests are kept). This is CancelAll
+    // semantics for pending actions: an accepted stop must not be followed by
+    // actions that were already in the FIFO when it was requested.
+    size_t dropPendingEvents();
 
     size_t dropped() const;
     size_t pending() const;
@@ -100,9 +122,12 @@ public:
     void postCancelSource(const std::string& source);
     void postCancelAll();
     void postDeviceRemoved(const std::string& source);
+    size_t eventsDroppedByCancel() const { return eventsDroppedByCancel_.load(); }
 
     size_t dropped() const { return queue_.dropped(); }
     size_t pending() const { return queue_.pending(); }
+    // True while an accepted emergency stop has not been acknowledged yet.
+    bool cancelPending() const { return engine_.cancelPending(); }
 
     // Test hook: process one queued item synchronously on the calling thread
     // (returns false if nothing was available within timeoutMs). Used by tests
@@ -117,6 +142,9 @@ private:
     EventQueue queue_;
     std::thread executor_;
     std::atomic<bool> running_{false};
+    // Queued events discarded because an emergency stop was in force when the
+    // executor was ready to run them (CancelAll semantics, observable).
+    std::atomic<size_t> eventsDroppedByCancel_{0};
 };
 
 } // namespace map
