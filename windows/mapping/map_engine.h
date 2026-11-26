@@ -194,6 +194,19 @@ public:
     void setSourceCleanupPrelockHook(std::function<void(const std::string&)> fn) {
         prelockHook_ = std::move(fn);
     }
+    // Test-only, empty in production. When set, cancelSource() probes the snapshot
+    // lock with try_lock() BEFORE taking it and reports whether the acquisition
+    // succeeded, so a test can prove the competing cleanup actually attempted the
+    // mutex and found it unavailable (real contention) rather than merely not
+    // having been scheduled. The report runs WITHOUT cancelTrackMu_ held when the
+    // probe fails, so it must not call back into the engine.
+    //
+    // Production path: with no probe installed, the snapshot still takes the lock
+    // directly via lock_guard - no try_lock, no extra atomic, identical linearization
+    // point.
+    void setSnapshotLockProbe(std::function<void(bool acquired)> fn) {
+        snapshotProbe_ = std::move(fn);
+    }
     // True while an accepted request has not been acknowledged yet. Producers may
     // poll these (read-only); only cancelAll()/cancelSource() acknowledge.
     bool cancelPending() const;
@@ -338,6 +351,8 @@ private:
     std::function<void(uint64_t)> stopPublishHook_;
     // Test-only pre-lock observer for cancelSource(). Empty in production.
     std::function<void(const std::string&)> prelockHook_;
+    // Test-only contention probe for the snapshot lock. Empty in production.
+    std::function<void(bool acquired)> snapshotProbe_;
     size_t textFailures_ = 0;   // executor-thread only, like the rest of the state
 
     static std::string ctrlKey(const std::string& s, const std::string& c) { return s + "|" + c; }

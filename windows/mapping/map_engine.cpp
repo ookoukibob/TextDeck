@@ -696,6 +696,19 @@ void Engine::cancelSource(const std::string& source, uint64_t requestEpoch) {
     if (prelock) prelock(source);
 
     const uint64_t covered = [&] {
+        // Test-only contention probe. It is installed only by tests; with no probe
+        // this collapses to the plain lock_guard path below, so the production
+        // linearization point is unchanged.
+        //
+        // try_lock() can report a spurious failure on some implementations, but the
+        // test that uses this holds cancelTrackMu_ for the entire observation
+        // window, so a failure is always genuine contention. The probe reports
+        // BEFORE the blocking acquisition, so it cannot itself delay the lock.
+        if (snapshotProbe_) {
+            const bool acquired = cancelTrackMu_.try_lock();
+            if (acquired) cancelTrackMu_.unlock();
+            snapshotProbe_(acquired);
+        }
         std::lock_guard<std::mutex> lk(cancelTrackMu_);
         return requestEpoch ? requestEpoch
                             : cancelEpoch_.load(std::memory_order_acquire);
