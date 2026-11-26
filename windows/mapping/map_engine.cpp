@@ -681,8 +681,19 @@ void Engine::cancelSource(const std::string& source, uint64_t requestEpoch) {
     // Snapshot BEFORE the cleanup, never after: a request that arrives while this
     // call is releasing keys is NOT covered by this cleanup and must stay pending
     // until its own acknowledgement, otherwise its keys would never be released.
-    const uint64_t covered = requestEpoch ? requestEpoch
-                                          : cancelEpoch_.load(std::memory_order_acquire);
+    //
+    // The snapshot is taken UNDER cancelTrackMu_, the same lock that publishes an
+    // epoch and registers its Stop scope. That mutual exclusion is what closes the
+    // window in which an epoch is visible but its scope is not yet recorded: a
+    // cleanup either snapshots before the Stop is published (seeing an older
+    // epoch) or after publication, when the scope is already registered. Reading
+    // cancelEpoch_ without the lock could observe the new epoch while stopRequests_
+    // still lacked it, and then acknowledge a global Stop as if it were ordinary.
+    const uint64_t covered = [&] {
+        std::lock_guard<std::mutex> lk(cancelTrackMu_);
+        return requestEpoch ? requestEpoch
+                            : cancelEpoch_.load(std::memory_order_acquire);
+    }();
     for (const auto& p : profiles_) {
         for (const Binding& b : p.second) {
             if (b.match.source == source) {
@@ -743,42 +754,57 @@ void Engine::cancelAll(uint64_t requestEpoch) {
 }
 
 uint64_t Engine::requestCancel() {
-    // Safe to call from any thread (producer/UI/device teardown): only flips
-    // atomics so a long delay/repeat/type_text script bails out early. The actual
-    // key release is performed by the executor via cancelAll()/cancelSource().
+    // Safe to call from any thread (producer/UI/device teardown): it allocates an
+    // epoch and publishes it so a long delay/repeat/type_text script bails out
+    // early. The actual key release is performed by the executor via
+    // cancelAll()/cancelSource().
     //
-    // The epoch is bumped BEFORE the flag is published so a reader that sees
-    // cancelRequested_==true always sees a matching epoch; dispatch()/runBlock()
-    // consult the epoch, so a request arriving during dispatch initialization is
-    // still honoured and can never be erased by the dispatcher.
-    const uint64_t epoch = cancelEpoch_.fetch_add(1, std::memory_order_acq_rel) + 1;
+    // Allocation and publication happen under cancelTrackMu_ together, because an
+    // epoch must never be observable before its scope is decided. For an ordinary
+    // cancellation the scope is "ordinary" by definition, so registering and
+    // publishing in one critical section is enough; requestStop() additionally
+    // records the Stop scope in the SAME section (see below).
+    std::lock_guard<std::mutex> lk(cancelTrackMu_);
+    const uint64_t epoch = ++nextEpoch_;
+    cancelEpoch_.store(epoch, std::memory_order_release);
     cancelRequested_.store(true, std::memory_order_release);
     return epoch;
 }
 
 uint64_t Engine::requestStop() {
-    // An emergency stop is a cancel plus "and do not start anything new". The
-    // stop epoch is published after the request epoch so no reader can see a stop
-    // without its cancel.
-    const uint64_t epoch = requestCancel();
-    // Monotonic max: two concurrent stops must not let the lower epoch win.
+    // An emergency stop is a cancel plus "and do not start anything new".
+    //
+    // CRITICAL: allocation, scope registration, publication and the stopEpoch_
+    // update form ONE indivisible operation under cancelTrackMu_. A cleanup thread
+    // takes the same lock to snapshot the epoch and to classify it, so it is
+    // impossible for it to observe this epoch without also observing its Stop
+    // scope. Publishing first and registering afterwards (the previous ordering)
+    // left exactly that window open: a default-argument cancelSource() could read
+    // the new epoch, find it absent from stopRequests_, and acknowledge a global
+    // Stop as though it were an ordinary cancellation.
+    std::lock_guard<std::mutex> lk(cancelTrackMu_);
+    const uint64_t epoch = ++nextEpoch_;
+    // Register the scope BEFORE publishing, so publication is the last step a
+    // concurrent reader can observe.
+    if (!isStopLocked(epoch)) {
+        stopRequests_.push_back(epoch);
+        std::sort(stopRequests_.begin(), stopRequests_.end());
+    }
+    // Monotonic max: two concurrent stops must not let the lower epoch win. Safe
+    // to compute under the lock because every stop publication does the same.
     uint64_t prev = stopEpoch_.load(std::memory_order_acquire);
     while (prev < epoch &&
            !stopEpoch_.compare_exchange_weak(prev, epoch,
                                              std::memory_order_acq_rel,
                                              std::memory_order_acquire)) {
     }
-    // Record the request's SCOPE before returning, so any later cleanup can tell
-    // whether it actually covers this request. This must happen before a producer
-    // could acknowledge the epoch (it has not received the value yet), so there is
-    // no window in which a Stop looks like an ordinary cancellation.
-    {
-        std::lock_guard<std::mutex> lk(cancelTrackMu_);
-        if (!isStopLocked(epoch)) {
-            stopRequests_.push_back(epoch);
-            std::sort(stopRequests_.begin(), stopRequests_.end());
-        }
-    }
+    // Test-only: expose the window between scope registration and publication. The
+    // hook runs while this thread holds cancelTrackMu_, so any cleanup it triggers
+    // on another thread must block on that lock - which is precisely the property
+    // under test. Empty in production.
+    if (stopPublishHook_) stopPublishHook_(epoch);
+    cancelEpoch_.store(epoch, std::memory_order_release);
+    cancelRequested_.store(true, std::memory_order_release);
     return epoch;
 }
 

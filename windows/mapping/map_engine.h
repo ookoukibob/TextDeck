@@ -179,6 +179,12 @@ public:
     // request, so the executor can acknowledge exactly it and not a later one.
     uint64_t requestCancel();
     uint64_t requestStop();
+    // Test-only observation hook, empty in production. Invoked from requestStop()
+    // while it holds cancelTrackMu_, i.e. at the exact point where the epoch has
+    // been allocated and its Stop scope registered but NOT yet published. A test
+    // uses it to run a concurrent source cleanup inside that window and prove it
+    // cannot acknowledge the Stop. It must not call back into the engine.
+    void setStopPublicationHook(std::function<void(uint64_t)> fn) { stopPublishHook_ = std::move(fn); }
     // True while an accepted request has not been acknowledged yet. Producers may
     // poll these (read-only); only cancelAll()/cancelSource() acknowledge.
     bool cancelPending() const;
@@ -286,7 +292,12 @@ private:
     uint64_t scriptInstance_ = 0;
     bool realtime_ = false;
     // Async cancellation handshake. See the state-machine note above.
-    //   cancelEpoch_  requests accepted so far (monotonic, bumped by producers)
+    //   nextEpoch_    the last epoch HANDED OUT (guarded by cancelTrackMu_)
+    //   cancelEpoch_  the newest epoch PUBLISHED as accepted. Publishing may lag
+    //                 allocation by one request: requestStop() takes an epoch under
+    //                 the lock, registers its Stop scope, and only then publishes.
+    //                 Readers therefore never observe an epoch whose scope is not
+    //                 yet recorded.
     //   cancelAcked_  every request up to here has been handled, in order. Requests
     //                 handled out of order are NOT folded into it (see
     //                 ackOutOfOrder_) because doing so would also "acknowledge"
@@ -295,11 +306,15 @@ private:
     std::atomic<uint64_t> cancelEpoch_{0};
     std::atomic<uint64_t> cancelAcked_{0};
     std::atomic<uint64_t> stopEpoch_{0};
+    // Guards the composite state transitions (epoch allocation, scope
+    // registration, Stop publication, acknowledgement). Being atomic is not enough
+    // for those: "allocate + register + publish" and "snapshot + classify" must each
+    // be indivisible with respect to the other.
+    mutable std::mutex cancelTrackMu_;
+    uint64_t nextEpoch_ = 0;             // guarded by cancelTrackMu_
     // Epochs of requests cleaned up while an older request was still unhandled.
     // Consulted by cancelAcknowledged()/stopPending(); superseded by cancelAcked_
-    // once the in-order watermark catches up. Guarded by cancelTrackMu_ because it
-    // is read by producers polling stopPending() and written by the executor.
-    mutable std::mutex cancelTrackMu_;
+    // once the in-order watermark catches up. Guarded by cancelTrackMu_.
     std::vector<uint64_t> ackOutOfOrder_;
     // Epochs published by requestStop(). A source-scoped cleanup must never
     // acknowledge one of these: releasing a single source's keys is not the global
@@ -309,6 +324,9 @@ private:
     std::vector<uint64_t> stopRequests_;
     // Kept for diagnostics; never the decision variable (that is the epoch logic).
     std::atomic<bool> cancelRequested_{false};
+    // Test-only observation hook for the publication window. Never set in
+    // production, so it does not affect the production path's semantics.
+    std::function<void(uint64_t)> stopPublishHook_;
     size_t textFailures_ = 0;   // executor-thread only, like the rest of the state
 
     static std::string ctrlKey(const std::string& s, const std::string& c) { return s + "|" + c; }

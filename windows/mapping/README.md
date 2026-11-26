@@ -179,17 +179,21 @@ acknowledge it:
 | `requestCancel()` | ordinary cancellation | `cancelSource()` (or global cleanup) |
 | `requestStop()` | global Stop | `cancelAll()` / `acknowledgeStop()` **only** |
 
-`requestStop()` records its epoch in the engine's stop set before returning, so a
-cleanup can always tell whether the request it is about to handle is a Stop.
-`cancelSource()` acknowledges only the ordinary cancellations at or below its
-snapshot epoch and skips any Stop - whether the epoch was passed explicitly or
-obtained through the default argument. Releasing one device's keys is not the
-global release a Stop requires, so acknowledging a Stop there would clear
-`stopPending()` while another device's key is still down.
+**Publication is atomic with scope registration.** `requestStop()` performs epoch
+allocation, Stop-scope registration, `stopEpoch_` update and epoch publication
+inside one `cancelTrackMu_` critical section. `cancelSource()` takes the same lock
+to snapshot the epoch it covers. Because both sides are serialised by that one
+mutex, a cleanup can never observe a published epoch whose scope is not yet
+recorded: it either snapshots before the Stop is published (seeing an older epoch)
+or after, when the scope is already registered. Publishing the epoch first and
+registering the scope afterwards — the earlier ordering — left exactly that
+window open.
 
-Multiple stops can be outstanding at once; each is tracked individually, so an
-older unhandled Stop is never satisfied by a newer source cleanup and a newer
-Stop is never satisfied by an older one.
+`cancelSource()` acknowledges only the ordinary cancellations at or below its
+snapshot epoch and skips any Stop, so releasing one device's keys never satisfies
+a request that demands a global release. Multiple stops can be outstanding at
+once; each is tracked individually, so an older unhandled Stop is never satisfied
+by a newer source cleanup and vice versa.
 
 ### Output release accounting
 
