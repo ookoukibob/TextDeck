@@ -865,7 +865,13 @@ int main() {
     // KeyOwnership::release() erased its entry before checking the result. A
     // rejected KeyUp could therefore be reported as success, dropping the only
     // record of a key that might still be physically down.
-    section("C17 refused physical KeyUp keeps ownership and is observable");
+    //
+    // Model (revised): active holder ownership (keyRefs_) and an unresolved
+    // PHYSICAL release (unresolved_) are separate facts. A failed release clears
+    // ownership - nobody holds the key - but records that the physical up still
+    // has to happen, so heldKeys() reflects holders only while unresolvedKeys()
+    // reflects outstanding physical state.
+    section("C17 refused physical KeyUp stays observable and retryable");
     {
         auto out = std::make_shared<FailBackend>();
         KeyOwnership ko;
@@ -877,16 +883,18 @@ int main() {
         check(!released, "c17-release-reports-failure", "");
         check(ko.outputFailures() == 1, "c17-failure-counted",
               "failures=" + std::to_string(ko.outputFailures()));
-        // The key must STILL be tracked: it may be physically down.
-        check(ko.isHeld("space"), "c17-key-still-tracked", "");
+        // The record must SURVIVE: the physical key may still be down.
         check(ko.isUnresolved("space"), "c17-key-recorded-unresolved", "");
         check(ko.unresolvedCount() == 1, "c17-unresolved-counted", "");
-        check(ko.heldKeys().size() == 1, "c17-still-in-held-keys", "");
+        check(ko.unresolvedKeys().size() == 1, "c17-unresolved-list", "");
+        // Ownership is genuinely gone: no holder remains.
+        check(!ko.isHeld("space"), "c17-no-active-owner-after-release", "");
+        check(ko.heldKeys().empty(), "c17-heldkeys-reflects-holders-only", "");
 
-        // A retry that succeeds clears the record honestly; a retry that fails
-        // again must not claim repair.
+        // A retry that fails again must not claim repair.
         check(ko.retryUnresolved(*out) == 0, "c17-retry-still-failing", "");
-        check(ko.isHeld("space") && ko.isUnresolved("space"), "c17-still-unresolved", "");
+        check(ko.isUnresolved("space"), "c17-still-unresolved", "");
+        // A retry that succeeds clears the record honestly.
         out->failUp = false;
         check(ko.retryUnresolved(*out) == 1, "c17-retry-resolves", "");
         check(!ko.isHeld("space") && ko.unresolvedCount() == 0,
@@ -906,8 +914,10 @@ int main() {
         ko.releaseAll(*out);
         check(ko.unresolvedCount() == 2, "c17b-both-unresolved",
               "unresolved=" + std::to_string(ko.unresolvedCount()));
-        check(ko.heldKeys().size() == 2, "c17b-state-not-lost",
+        // Emergency cleanup drops ALL holders, so ownership is empty...
+        check(ko.heldKeys().empty(), "c17b-holders-cleared",
               "held=" + std::to_string(ko.heldKeys().size()));
+        // ...but the outstanding physical state is retained and reported.
         auto u = ko.unresolvedKeys();
         check(u.size() == 2 && u[0] == "a" && u[1] == "ctrl",
               "c17b-unresolved-list-sorted", "");
@@ -1007,13 +1017,14 @@ int main() {
     }
 
     // ---- C19: stop acknowledgement must not outrun the FIFO barrier ----------
-    // Regression for: cancelAll() acknowledged the stop, and only afterwards
-    // dropped the FIFO. A producer could see the stop as complete, post a
-    // legitimate post-stop event, and have it deleted by that later sweep.
+    // Regression for: the stop was acknowledged before the FIFO was cleaned, so a
+    // producer could see completion, post a legitimate event, and lose it to the
+    // sweep that ran afterwards.
     //
-    // This drives the REAL handle() path and posts from inside the
-    // post-acknowledgement hook, which is exactly the window the old ordering
-    // left open. No sleeps and no manual re-implementation of the steps.
+    // EXECUTION MODEL (corrected): exactly ONE consumer. The real runtime executor
+    // thread consumes every item; the test thread never calls processOne() while
+    // it is running. Synchronisation is a condition variable signalled from the
+    // post-acknowledgement hook - a deterministic boundary, not a sleep.
     section("C19 post-stop event survives the cleanup sweep");
     {
         auto out = std::make_shared<HookBackend>();
@@ -1022,38 +1033,61 @@ int main() {
         Action t; t.kind = ActionKind::KeyTap; t.key = "k"; b.script = {t};
         rt.engine().addBinding(b);
 
-        bool posted = false;
+        std::mutex              mu;
+        std::condition_variable cv;
+        bool acked = false;
+        bool postedFromHook = false;
+
+        // This fires on the EXECUTOR thread, immediately after the stop becomes
+        // externally visible and before handle() returns. It is the precise window
+        // the old ordering left open. The producer's post here is the legitimate
+        // post-stop event that must survive.
         rt.setOnStopAcknowledged([&] {
-            if (!posted) { posted = true; rt.post(press("s", "c", 3)); }
+            {
+                std::lock_guard<std::mutex> lk(mu);
+                postedFromHook = true;
+                rt.post(press("s", "c", 3));
+                acked = true;
+            }
+            cv.notify_all();
         });
 
-        // The runtime must appear to have an executor for postCancelAll to take
-        // the QUEUED control path (the inline path is covered by C18). start() is
-        // real; the barrier + hook below then drive the exact ordering.
-        rt.start();
+        rt.start();                       // the ONLY consumer from here on
 
-        // Pre-stop work sits in the queue, ahead of the control item.
+        // Pre-stop work, known to be enqueued before the control item.
         rt.post(press("s", "c", 1));
         rt.post(press("s", "c", 2));
+        rt.postCancelAll();               // queued control item (priority channel)
 
-        rt.postCancelAll();                      // queued control item (epoch N)
+        // Wait (bounded) for the executor to reach the acknowledgement boundary.
+        {
+            std::unique_lock<std::mutex> lk(mu);
+            bool reached = cv.wait_for(lk, std::chrono::seconds(10), [&] { return acked; });
+            check(reached, "c19-executor-reached-acknowledgement", "");
+        }
 
-        // Drain: control items first, so the stop is applied before the events.
-        while (rt.processOne(0)) {}
-        check(posted, "c19-producer-posted-after-completion", "");
+        // Let the single consumer finish the post-stop event too, then stop it
+        // before asserting, so no assertion races the executor.
+        bool ranAfter = false;
+        for (int i = 0; i < 200 && !ranAfter; ++i) {
+            ranAfter = taps(out->ops, "k") >= 1;
+            if (!ranAfter) std::this_thread::sleep_for(std::chrono::milliseconds(5));
+        }
+        rt.stop();                        // join: no consumer remains
+
+        check(postedFromHook, "c19-producer-posted-at-boundary", "");
         check(!rt.cancelPending(), "c19-stop-complete", "");
 
-        int ran = taps(out->ops, "k");
+        const int ran = taps(out->ops, "k");
         check(ran == 1, "c19-exactly-the-post-stop-event-ran",
               "ran=" + std::to_string(ran));
         check(rt.eventsDroppedByCancel() >= 2, "c19-pre-stop-events-dropped",
               "dropped=" + std::to_string(rt.eventsDroppedByCancel()));
+        check(!ranAfter || ran == 1, "c19-no-extra-action", "");
 
-        // The survivor is the event posted after the stop became visible - not one
-        // of the pre-stop ones - and nothing else is left behind.
-        check(!rt.processOne(0), "c19-queue-empty-after-drain", "");
-        check(taps(out->ops, "k") == 1, "c19-no-extra-action", "");
-        rt.stop();
+        // Single-consumer check: the queue is empty now that the executor drained
+        // it and stopped. processOne() is used only AFTER the executor is gone.
+        check(!rt.processOne(0), "c19-queue-empty-after-single-consumer-drain", "");
     }
 
     // ---- C20: legacy cancelSource()/cancelAll() defaults must not leave a
@@ -1085,6 +1119,184 @@ int main() {
         check(!e.cancelPending(), "c20-direct-call-clears-outstanding", "");
         e.dispatch(press("s", "c", 2));
         check(taps(out->ops, "k") == 2, "c20-runs-after-clearing", "");
+    }
+
+    // ---- C20b: default cancelSource() after a request was published ---------
+    // Regression for: cancelSource() snapshotted the current epoch when
+    // requestEpoch == 0 but only acknowledged when requestEpoch was nonzero, so
+    //   requestCancel(); cancelSource("padA");
+    // stranded a request the call had already handled, blocking every later
+    // dispatch. This is the case C20 could not see because no request existed.
+    section("C20b default cancelSource clears a request it handled");
+    {
+        auto out = std::make_shared<HookBackend>();
+        Engine e(out);
+        Binding hold; hold.id = "c20bh"; hold.match = {"padA", "b", EventType::Pressed};
+        hold.trigger = TriggerKind::Momentary; hold.holdKey = "space";
+        Binding act; act.id = "c20ba"; act.match = {"s", "c", EventType::Pressed};
+        Action t; t.kind = ActionKind::KeyTap; t.key = "k"; act.script = {t};
+        e.addBinding(hold);
+        e.addBinding(act);
+
+        e.dispatch(press("padA", "b", 1000));
+        check(out->isHeld("space"), "c20b-key-held", "");
+
+        // The exact legacy sequence: publish a request, then clean up directly.
+        e.requestCancel();
+        check(e.cancelPending(), "c20b-request-published", "");
+        e.cancelSource("padA");                       // default requestEpoch = 0
+        check(!out->isHeld("space"), "c20b-source-keys-released", "");
+        // The call covered that request, so it must not be left pending.
+        check(!e.cancelPending(), "c20b-default-call-clears-handled-request", "");
+        e.dispatch(press("s", "c", 1));
+        check(taps(out->ops, "k") == 1, "c20b-dispatch-resumes", "");
+
+        // A per-source cleanup must NOT acknowledge a GLOBAL stop that it did not
+        // cover: a stop published BEFORE the snapshot stays pending (only a global
+        // releaseAll satisfies it), while the newer per-source request it does
+        // cover is cleared.
+        const uint64_t stopEpoch = e.requestStop();    // older: a global stop
+        e.requestCancel();                             // newer: per-source cancel
+        e.cancelSource("padA");                        // covers the newer one only
+        check(e.stopPending(), "c20b-newer-stop-not-acknowledged", "");
+        check(!e.cancelAcknowledged(stopEpoch), "c20b-newer-epoch-still-pending", "");
+        e.cancelAll();
+        check(!e.cancelPending(), "c20b-global-cleanup-clears", "");
+        e.dispatch(press("s", "c", 2));
+        check(taps(out->ops, "k") == 2, "c20b-runs-after-global-cleanup", "");
+    }
+
+    // ---- C21: an unresolved record must never release another holder's key ---
+    // Regression for the reported scenario:
+    //   1. A presses Space; A releases it, the backend refuses the KeyUp.
+    //   2. B presses Space while that unresolved record exists.
+    //   3. retryUnresolved() used to send KeyUp and drop the record, physically
+    //      releasing a key B still legitimately owns.
+    section("C21 unresolved retry must not release another holder's key");
+    {
+        auto out = std::make_shared<FailBackend>();
+        KeyOwnership ko;
+
+        // 1. A holds, then its physical release is refused.
+        check(ko.press("space", "A", *out), "c21-A-pressed", "");
+        out->failUp = true;
+        check(!ko.release("space", "A", *out), "c21-A-release-refused", "");
+        check(ko.isUnresolved("space"), "c21-orphan-recorded", "");
+        check(!ko.isHeld("space"), "c21-no-active-owner", "");
+
+        // 2. B acquires the same key. A new physical down must be emitted because
+        //    nobody actively owns it (the key may be stuck down, so a second
+        //    down is harmless and keeps the model honest).
+        out->failUp = false;
+        const size_t upsBefore = count(out->ops, "up:space");
+        ko.press("space", "B", *out);
+        check(ko.isHeld("space"), "c21-B-holds", "");
+        check(ko.heldKeys().size() == 1, "c21-exactly-one-holder", "");
+
+        // 3. Retrying must NOT send a KeyUp while B is an active holder.
+        const size_t upsBeforeRetry = count(out->ops, "up:space");
+        size_t resolved = ko.retryUnresolved(*out);
+        check(resolved == 0, "c21-retry-refused-while-held",
+              "resolved=" + std::to_string(resolved));
+        check(count(out->ops, "up:space") == upsBeforeRetry,
+              "c21-no-keyup-emitted-while-held", "");
+        check(ko.isHeld("space") && ko.isUnresolved("space"),
+              "c21-state-preserved", "");
+
+        // 4. B releases normally: that op is honoured and clears the orphan.
+        check(ko.release("space", "B", *out), "c21-B-release-succeeds", "");
+        check(!ko.isHeld("space"), "c21-no-holder-after-B", "");
+        check(ko.unresolvedCount() == 0, "c21-orphan-cleared-by-handoff", "");
+        check(count(out->ops, "up:space") == upsBefore + 1,
+              "c21-exactly-one-physical-up", "");
+    }
+
+    // ---- C21b: three holders, orphan in the middle ---------------------------
+    section("C21b retry with three overlapping holders");
+    {
+        auto out = std::make_shared<FailBackend>();
+        KeyOwnership ko;
+        ko.press("enter", "A", *out);
+        ko.press("enter", "B", *out);
+        ko.press("enter", "C", *out);
+        check(ko.heldKeys().size() == 1, "c21b-one-key-three-holders", "");
+
+        out->failUp = true;
+        ko.release("enter", "A", *out);            // not last: no physical up
+        check(ko.isHeld("enter"), "c21b-still-held-after-A", "");
+        check(ko.unresolvedCount() == 0, "c21b-no-orphan-yet", "");
+
+        ko.release("enter", "C", *out);            // still B
+        check(ko.isHeld("enter"), "c21b-still-held-after-C", "");
+
+        // B is the last active holder; its refused up creates the orphan.
+        check(!ko.release("enter", "B", *out), "c21b-B-release-refused", "");
+        check(ko.isUnresolved("enter"), "c21b-orphan-recorded", "");
+        check(!ko.isHeld("enter"), "c21b-no-active-holder", "");
+
+        // Repeated failed retries stay observable and do not corrupt counts.
+        for (int i = 0; i < 3; ++i) check(ko.retryUnresolved(*out) == 0, "c21b-retry-fails", "");
+        check(ko.unresolvedCount() == 1, "c21b-unresolved-count-stable", "");
+        check(ko.heldCount() == 0, "c21b-holder-count-zero", "");
+
+        out->failUp = false;
+        check(ko.retryUnresolved(*out) == 1, "c21b-retry-clears", "");
+        check(ko.unresolvedCount() == 0 && ko.heldKeys().empty(),
+              "c21b-clean", "");
+    }
+
+    // ---- C22: the stop must still be PENDING at the pre-barrier boundary -----
+    // This is the regression that fails if cancelAll(0) is ever restored in place
+    // of releaseAllKeys(): cancelAll's default epoch snapshots and acknowledges
+    // internally, so stop pending would already be false before the barrier.
+    // It observes the acknowledgement state at the precise boundary rather than
+    // only the final queue contents.
+    section("C22 stop is not acknowledged before the queue barrier");
+    {
+        auto out = std::make_shared<HookBackend>();
+        MappingRuntime rt(out, 64);
+        Binding b; b.id = "c22"; b.match = {"s", "c", EventType::Pressed};
+        Action t; t.kind = ActionKind::KeyTap; t.key = "k"; b.script = {t};
+        rt.engine().addBinding(b);
+
+        std::mutex mu;
+        std::condition_variable cv;
+        bool reachedBoundary = false;
+        bool pendingAtBoundary = false;
+        bool ackedAtBoundary = false;
+        uint64_t observedEpoch = 0;
+
+        rt.setOnBeforeBarrier([&] {
+            std::lock_guard<std::mutex> lk(mu);
+            // State sampled BETWEEN key release and the FIFO barrier.
+            pendingAtBoundary = rt.engine().stopPending();
+            ackedAtBoundary = rt.engine().cancelPending();
+            observedEpoch = rt.engine().pendingStopEpoch();
+            reachedBoundary = true;
+            cv.notify_all();
+        });
+
+        rt.start();
+        rt.post(press("s", "c", 1));
+        rt.postCancelAll();
+
+        {
+            std::unique_lock<std::mutex> lk(mu);
+            check(cv.wait_for(lk, std::chrono::seconds(10), [&] { return reachedBoundary; }),
+                  "c22-executor-reached-pre-barrier", "");
+        }
+        rt.stop();
+
+        // The stop MUST still look pending: its keys were released, but the FIFO
+        // has not been cleaned and completion has not been published.
+        check(pendingAtBoundary, "c22-stop-pending-at-pre-barrier-boundary", "");
+        check(ackedAtBoundary, "c22-cancel-pending-at-pre-barrier-boundary", "");
+        check(observedEpoch != 0, "c22-pending-epoch-visible",
+              "epoch=" + std::to_string(observedEpoch));
+
+        // After completion the stop is done and dispatch proceeds normally.
+        check(!rt.cancelPending(), "c22-stop-complete-after-barrier", "");
+        check(rt.eventsDroppedByCancel() >= 1, "c22-pre-stop-event-dropped", "");
     }
 
     std::printf("\n%d checks, %d passed, %d failed\n", g_check, g_pass, g_fail);

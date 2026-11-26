@@ -658,11 +658,18 @@ void Engine::cancelSource(const std::string& source, uint64_t requestEpoch) {
         else ++it;
     }
     // A per-source stop is complete once that source's keys are released and its
-    // stale trigger state is gone. ONLY its own epoch is acknowledged: this sweep
-    // does not cover any other request (a global stop for an older epoch still
-    // owes a full releaseAll), so acknowledging a range here would unblock
-    // dispatch before the emergency release had run.
-    if (requestEpoch) acknowledgeCancel(covered);
+    // stale trigger state is gone, so the request this cleanup covers is
+    // acknowledged - for BOTH the explicit-epoch form (queued control item) and
+    // the legacy default form. Leaving the default form unacknowledged would let
+    //   requestCancel(); cancelSource("padA");
+    // strand a request that this call already handled, blocking every later
+    // dispatch forever.
+    //
+    // Only the SNAPSHOTTED epoch is acknowledged, never a range: this sweep does
+    // not cover other requests (a global stop for an older epoch still owes a full
+    // releaseAll), so acknowledging a range would unblock dispatch too early. A
+    // newer request that arrived after the snapshot keeps its own pending state.
+    if (covered) acknowledgeCancel(covered);
 }
 
 void Engine::releaseAllKeys() {

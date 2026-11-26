@@ -262,12 +262,14 @@ void MappingRuntime::postCancelAll() {
         std::lock_guard<std::mutex> life(lifeMu_);
         if (!running_) {
             inlineCleanups_.fetch_add(1);
-            // No executor: apply cleanup and acknowledgement as one step, with
-            // the FIFO barrier taken before the stop becomes visible as complete.
-            engine_.cancelAll(epoch);
+            // No executor: perform the same three-step order as the queued path.
+            // releaseAllKeys() (not cancelAll()) so the stop is NOT acknowledged
+            // until the FIFO barrier has been applied.
+            engine_.releaseAllKeys();
             queue_.dropPendingControl();
             size_t discarded = queue_.applyStopBarrier();
             if (discarded) eventsDroppedByCancel_.fetch_add(discarded);
+            engine_.acknowledgeStop(epoch);
             return;
         }
     }
@@ -339,7 +341,17 @@ void MappingRuntime::handle(const QueueItem& it) {
         //      "complete" to producers.
         // Acknowledging before the barrier let a producer see the stop as done,
         // post a legitimate event, and lose it to the sweep that ran afterwards.
-        engine_.cancelAll(0);                      // (1) engine-side release only
+        //
+        // (1) MUST be releaseAllKeys(), NOT cancelAll(). cancelAll() with its
+        // default epoch snapshots the current epoch and acknowledges it
+        // internally, so it would make the stop observable BEFORE the barrier -
+        // exactly the defect this ordering exists to prevent. releaseAllKeys() is
+        // cleanup only and touches no acknowledgement state.
+        engine_.releaseAllKeys();                  // (1) engine-side release only
+        // Test-only: at this instant the stop must NOT be observable as complete.
+        // If an implicit acknowledgement happened in step (1), stopPending() is
+        // already false here and the regression test fails at this boundary.
+        if (onBeforeBarrier_) onBeforeBarrier_();
         {
             size_t discarded = queue_.applyStopBarrier();   // (2)
             if (discarded) eventsDroppedByCancel_.fetch_add(discarded);

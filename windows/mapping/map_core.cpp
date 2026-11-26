@@ -189,15 +189,17 @@ bool KeyOwnership::release(const std::string& key, const std::string& holder, Ou
     hIt->second = 0;
     auto keyIt = keyRefs_.find(key);
     if (keyIt == keyRefs_.end()) return false;
-    if (--keyIt->second > 0) return false;      // still held by another holder
-    // Last holder: attempt the physical up. If the backend refuses, the key may
-    // still be physically down, so the ownership entry is KEPT and the key is
-    // recorded as unresolved. Erasing it here would discard the only record of a
-    // key that might still be held, and nothing could ever retry the release.
+    if (--keyIt->second > 0) return false;      // still actively held by another holder
+    // Last ACTIVE holder. keyRefs_ is a pure active-holder count and is cleared
+    // here either way: a refused KeyUp means "the physical key may still be down
+    // with nobody owning it", which is exactly what unresolved_ records. Keeping
+    // an artificial refcount of 1 instead (the previous behaviour) made a later
+    // holder look like a non-owner, so retryUnresolved() could release a key a
+    // different, active holder legitimately owns.
     if (!out.keyUp(key)) {
         ++outputFailures_;
         unresolved_[key]++;
-        keyIt->second = 1;                      // stays tracked: still logically down
+        keyRefs_.erase(keyIt);
         return false;
     }
     unresolved_.erase(key);
@@ -211,11 +213,12 @@ void KeyOwnership::releaseAllByHolder(const std::string& holder, OutputBackend& 
             auto keyIt = keyRefs_.find(it->first.first);
             if (keyIt != keyRefs_.end() && --keyIt->second <= 0) {
                 if (!out.keyUp(it->first.first)) {
-                    // Same rule as release(): a refused physical up keeps the key
-                    // tracked and recorded so a later sweep can retry it.
+                    // Same rule as release(): the failed physical up is recorded as
+                    // unresolved, and active ownership is cleared so the record is
+                    // NOT mistaken for a holder.
                     ++outputFailures_;
                     unresolved_[it->first.first]++;
-                    keyIt->second = 1;
+                    keyRefs_.erase(keyIt);
                 } else {
                     unresolved_.erase(it->first.first);
                     keyRefs_.erase(keyIt);
@@ -228,20 +231,27 @@ void KeyOwnership::releaseAllByHolder(const std::string& holder, OutputBackend& 
     }
 }
 void KeyOwnership::releaseAll(OutputBackend& out) {
-    // Emergency sweep. A key whose up is refused stays tracked and unresolved:
-    // the caller can observe it (unresolvedKeys()) and retry, and the state still
-    // reflects that the key may be physically down.
-    for (auto it = keyRefs_.begin(); it != keyRefs_.end();) {
-        if (out.keyUp(it->first)) {
-            unresolved_.erase(it->first);
-            it = keyRefs_.erase(it);
+    // Emergency sweep: every known key - active holders AND keys left unresolved by
+    // an earlier failed release - gets one physical-up attempt. Failures are
+    // retained in unresolved_ and reported, never cleared as if they succeeded.
+    std::vector<std::string> keys;
+    keys.reserve(keyRefs_.size() + unresolved_.size());
+    for (const auto& kv : keyRefs_) keys.push_back(kv.first);
+    for (const auto& kv : unresolved_) {
+        if (keyRefs_.find(kv.first) == keyRefs_.end()) keys.push_back(kv.first);
+    }
+    for (const auto& key : keys) {
+        if (out.keyUp(key)) {
+            unresolved_.erase(key);
+            keyRefs_.erase(key);
         } else {
             ++outputFailures_;
-            unresolved_[it->first]++;
-            ++it;
+            unresolved_[key]++;
         }
     }
+    // Holders are dropped: this is an emergency stop, not a partial release.
     perHolder_.clear();
+    keyRefs_.clear();
     // The backend's own all-keys sweep is still attempted, but its result is not
     // reported as success for keys that remain unresolved above.
     out.releaseAll();
@@ -258,8 +268,12 @@ std::vector<std::string> KeyOwnership::unresolvedKeys() const {
 size_t KeyOwnership::retryUnresolved(OutputBackend& out) {
     size_t resolved = 0;
     for (auto it = unresolved_.begin(); it != unresolved_.end();) {
+        // NEVER send a physical KeyUp while an active holder owns the key: doing so
+        // would release another input source's key. The unresolved record simply
+        // waits until the last holder releases, at which point the normal release
+        // path retries it itself.
+        if (keyRefs_.find(it->first) != keyRefs_.end()) { ++it; continue; }
         if (out.keyUp(it->first)) {
-            keyRefs_.erase(it->first);
             it = unresolved_.erase(it);
             ++resolved;
         } else {

@@ -175,6 +175,11 @@ public:
     // prove that whatever a producer does once it can see completion is never
     // destroyed by a cleanup step that runs later.
     void setOnStopAcknowledged(std::function<void()> fn) { onStopAcked_ = std::move(fn); }
+    // Invoked after key release and BEFORE the queue barrier, with the state the
+    // stop would have if it were already acknowledged. A correct implementation
+    // must still report the stop as pending here; that is what proves the stop is
+    // not acknowledged before the FIFO is cleaned.
+    void setOnBeforeBarrier(std::function<void()> fn) { onBeforeBarrier_ = std::move(fn); }
 
 private:
     void loop();
@@ -198,6 +203,8 @@ private:
     std::mutex lifeMu_;
     // Test-only observer, called right after a stop is acknowledged.
     std::function<void()> onStopAcked_;
+    // Test-only observer, called between key release and the queue barrier.
+    std::function<void()> onBeforeBarrier_;
     // Test-only observer, called inside stop() between request and join.
     std::function<void()> onStopJoining_;
     // How many producers performed an inline Engine mutation. Must stay 0 while

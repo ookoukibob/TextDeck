@@ -172,13 +172,46 @@ event, and lose it to the sweep that ran afterwards. The no-executor path in
 ### Output release accounting
 
 `SendInputBackend::send()` checks the value returned by `SendInput()`. A physical
-KeyUp that Windows did not accept is reported as a failure, and
-`KeyOwnership::release()` keeps its bookkeeping entry: the key stays in
-`heldKeys()`, is recorded in `unresolvedKeys()`, and can be retried with
-`retryUnresolved()`. Emergency cleanup therefore reports unresolved releases
-instead of silently forgetting a key that might still be physically down.
-A `SendInput` success only means Windows accepted the INPUT structure; it is not a
-claim about what the target application did.
+KeyUp that Windows did not accept is reported as a failure. A `SendInput` success
+only means Windows accepted the INPUT structure; it is not a claim about what the
+target application did.
+
+Active holder ownership and an outstanding physical release are **separate
+facts**:
+
+| State | Meaning | Accessor |
+|---|---|---|
+| `keyRefs_` | active holders (refcounted) | `heldKeys()`, `isHeld()` |
+| `unresolved_` | a physical KeyUp that was refused | `unresolvedKeys()`, `isUnresolved()` |
+
+A refused release clears the holder count (nobody owns the key any more) but
+records the outstanding physical up, so `heldKeys()` never reports a key as held
+by someone who released it. `retryUnresolved()` refuses to send a KeyUp while any
+active holder still owns that key, because doing so would physically release
+another input source's key. Once the last holder releases, the normal release
+path retries the orphan itself; an explicit retry also clears it. Emergency
+`releaseAll()` drops every holder but retains and reports any key whose physical
+up could not be delivered.
+
+### Stop ordering: cleanup vs acknowledgement APIs
+
+`Engine::cancelAll(epoch)` is *cleanup plus acknowledgement*: with its default
+epoch it snapshots the current epoch and acknowledges it internally. It must
+therefore **never** be used as the first step of a queue-managed stop, because
+that would make the stop observable before the FIFO barrier runs. The queued and
+no-executor paths both use the split form:
+
+```
+engine_.releaseAllKeys();      // (1) cleanup only, no acknowledgement state
+queue_.applyStopBarrier();     // (2) discard events enqueued at or before now
+engine_.acknowledgeStop(ep);   // (3) publish completion
+```
+
+A direct `Engine::cancelSource()` / `cancelAll()` with the default
+`requestEpoch == 0` acknowledges exactly the epoch it snapshotted at entry: a
+request it handled is never left pending, and a newer request it did not cover
+stays pending. Explicit-epoch calls behave the same way, which is what queued
+control items rely on.
 
 ## Limitations
 
