@@ -1593,7 +1593,15 @@ int main() {
                 e.cancelSource("padA");                 // default-argument form
                 stopStillPendingAfterCleanup.store(e.stopPending());
                 stopAckedAfterCleanup.store(e.cancelAcknowledged(rivalEpoch));
-                rivalFinishedCleanup.store(true);
+                {
+                    // The store must happen under hsMu: the waiter evaluates this
+                    // predicate while holding hsMu, so publishing the flag outside
+                    // the lock left a window in which the notify could be consumed
+                    // before the predicate was re-checked, costing a spurious 10 s
+                    // timeout. Flag kept atomic; only the publication is ordered.
+                    std::lock_guard<std::mutex> lk(hsMu);
+                    rivalFinishedCleanup.store(true);
+                }
                 hsCv.notify_all();
             });
 
