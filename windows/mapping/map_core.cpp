@@ -133,9 +133,19 @@ bool RecordOutput::keyUp(const std::string& key) {
     ops.push_back("up:" + key);
     return true;
 }
-bool RecordOutput::typeText(const std::string& text) {
-    ops.push_back("text:" + text);
-    return true;
+TextOutcome RecordOutput::typeText(const std::string& text, const CancelProbe& cancelled) {
+    // Recording backend mirrors the real backends: one character per safe input
+    // unit, and a cancelled run records only what it actually emitted.
+    std::string sent;
+    for (char c : text) {
+        if (cancelled && cancelled()) {
+            if (!sent.empty()) ops.push_back("text:" + sent);
+            return TextOutcome::Cancelled;
+        }
+        sent += c;
+    }
+    ops.push_back("text:" + sent);
+    return TextOutcome::Ok;
 }
 bool RecordOutput::releaseAll() {
     for (const auto& kv : held_) ops.push_back("up:" + kv.first);
@@ -178,12 +188,23 @@ bool KeyOwnership::release(const std::string& key, const std::string& holder, Ou
     if (hIt == perHolder_.end() || hIt->second == 0) return false;
     hIt->second = 0;
     auto keyIt = keyRefs_.find(key);
-    if (keyIt != keyRefs_.end() && --keyIt->second <= 0) {
+    if (keyIt == keyRefs_.end()) return false;
+    if (--keyIt->second > 0) return false;      // still actively held by another holder
+    // Last ACTIVE holder. keyRefs_ is a pure active-holder count and is cleared
+    // here either way: a refused KeyUp means "the physical key may still be down
+    // with nobody owning it", which is exactly what unresolved_ records. Keeping
+    // an artificial refcount of 1 instead (the previous behaviour) made a later
+    // holder look like a non-owner, so retryUnresolved() could release a key a
+    // different, active holder legitimately owns.
+    if (!out.keyUp(key)) {
+        ++outputFailures_;
+        unresolved_[key]++;
         keyRefs_.erase(keyIt);
-        if (!out.keyUp(key)) { ++outputFailures_; return false; } // physical down->up failed
-        return true;
+        return false;
     }
-    return false;
+    unresolved_.erase(key);
+    keyRefs_.erase(keyIt);
+    return true;
 }
 void KeyOwnership::releaseAllByHolder(const std::string& holder, OutputBackend& out) {
     for (auto it = perHolder_.begin(); it != perHolder_.end();) {
@@ -191,8 +212,17 @@ void KeyOwnership::releaseAllByHolder(const std::string& holder, OutputBackend& 
             it->second = 0;
             auto keyIt = keyRefs_.find(it->first.first);
             if (keyIt != keyRefs_.end() && --keyIt->second <= 0) {
-                keyRefs_.erase(keyIt);
-                if (!out.keyUp(it->first.first)) ++outputFailures_;
+                if (!out.keyUp(it->first.first)) {
+                    // Same rule as release(): the failed physical up is recorded as
+                    // unresolved, and active ownership is cleared so the record is
+                    // NOT mistaken for a holder.
+                    ++outputFailures_;
+                    unresolved_[it->first.first]++;
+                    keyRefs_.erase(keyIt);
+                } else {
+                    unresolved_.erase(it->first.first);
+                    keyRefs_.erase(keyIt);
+                }
             }
             ++it;
         } else {
@@ -201,10 +231,57 @@ void KeyOwnership::releaseAllByHolder(const std::string& holder, OutputBackend& 
     }
 }
 void KeyOwnership::releaseAll(OutputBackend& out) {
-    for (auto& kv : keyRefs_) out.keyUp(kv.first);
-    keyRefs_.clear();
+    // Emergency sweep: every known key - active holders AND keys left unresolved by
+    // an earlier failed release - gets one physical-up attempt. Failures are
+    // retained in unresolved_ and reported, never cleared as if they succeeded.
+    std::vector<std::string> keys;
+    keys.reserve(keyRefs_.size() + unresolved_.size());
+    for (const auto& kv : keyRefs_) keys.push_back(kv.first);
+    for (const auto& kv : unresolved_) {
+        if (keyRefs_.find(kv.first) == keyRefs_.end()) keys.push_back(kv.first);
+    }
+    for (const auto& key : keys) {
+        if (out.keyUp(key)) {
+            unresolved_.erase(key);
+            keyRefs_.erase(key);
+        } else {
+            ++outputFailures_;
+            unresolved_[key]++;
+        }
+    }
+    // Holders are dropped: this is an emergency stop, not a partial release.
     perHolder_.clear();
+    keyRefs_.clear();
+    // The backend's own all-keys sweep is still attempted, but its result is not
+    // reported as success for keys that remain unresolved above.
     out.releaseAll();
+}
+bool KeyOwnership::isUnresolved(const std::string& key) const {
+    return unresolved_.find(key) != unresolved_.end();
+}
+std::vector<std::string> KeyOwnership::unresolvedKeys() const {
+    std::vector<std::string> v;
+    for (const auto& kv : unresolved_) v.push_back(kv.first);
+    std::sort(v.begin(), v.end());
+    return v;
+}
+size_t KeyOwnership::retryUnresolved(OutputBackend& out) {
+    size_t resolved = 0;
+    for (auto it = unresolved_.begin(); it != unresolved_.end();) {
+        // NEVER send a physical KeyUp while an active holder owns the key: doing so
+        // would release another input source's key. The unresolved record simply
+        // waits until the last holder releases, at which point the normal release
+        // path retries it itself.
+        if (keyRefs_.find(it->first) != keyRefs_.end()) { ++it; continue; }
+        if (out.keyUp(it->first)) {
+            it = unresolved_.erase(it);
+            ++resolved;
+        } else {
+            ++outputFailures_;
+            ++it;
+        }
+    }
+    return resolved;
 }
 bool KeyOwnership::isHeld(const std::string& key) const {
     return keyRefs_.find(key) != keyRefs_.end();
@@ -269,17 +346,25 @@ class SendInputBackend final : public OutputBackend {
 public:
     bool keyDown(const std::string& key) override { return send(key, false); }
     bool keyUp(const std::string& key) override { return send(key, true); }
-    bool typeText(const std::string& text) override {
-        bool ok = true;
+    TextOutcome typeText(const std::string& text, const CancelProbe& cancelled) override {
+        // Every character is one complete down/up pair, so a cancellation that
+        // lands between characters leaves nothing pressed. A pair whose key-up
+        // leg was refused is repaired here before returning, so an emergency
+        // stop can never leave this backend holding a Unicode scan code.
         for (char c : text) {
+            if (cancelled && cancelled()) return TextOutcome::Cancelled;
             INPUT in[2] = {};
             in[0].type = INPUT_KEYBOARD; in[0].ki.wScan = (WORD)(unsigned char)c;
             in[0].ki.dwFlags = KEYEVENTF_UNICODE;
             in[1].type = INPUT_KEYBOARD; in[1].ki.wScan = (WORD)(unsigned char)c;
             in[1].ki.dwFlags = KEYEVENTF_UNICODE | KEYEVENTF_KEYUP;
-            if (SendInput(2, in, sizeof(INPUT)) != 2) ok = false;
+            UINT sent = SendInput(2, in, sizeof(INPUT));
+            if (sent != 2) {
+                if (sent == 1) SendInput(1, &in[1], sizeof(INPUT)); // repair: release the down leg
+                return TextOutcome::Failed;
+            }
         }
-        return ok;
+        return TextOutcome::Ok;
     }
     bool releaseAll() override {
         // Release every non-modifier key we can enumerate; the caller (key
@@ -295,8 +380,11 @@ private:
         in.type = INPUT_KEYBOARD;
         in.ki.wVk = vk;
         if (up) in.ki.dwFlags = KEYEVENTF_KEYUP;
-        SendInput(1, &in, sizeof(INPUT));
-        return true;
+        // Check what Windows actually accepted. SendInput returns how many INPUT
+        // structures it inserted; 0 means UIPI blocked it or the queue was full.
+        // Reporting true regardless left KeyOwnership believing a key had been
+        // released while the OS never saw the event.
+        return SendInput(1, &in, sizeof(INPUT)) == 1;
     }
 };
 
@@ -310,24 +398,62 @@ public:
     ~HidDriverBackend() override { close(); }
     bool keyDown(const std::string& key) override { return send(key, true); }
     bool keyUp(const std::string& key) override { return send(key, false); }
-    bool typeText(const std::string& text) override {
+    TextOutcome typeText(const std::string& text, const CancelProbe& cancelled) override {
         // Type ASCII via per-character strokes: hold Shift when the character
         // needs it (Modifiers is the COMPLETE held set), press/release the
         // usage, then clear modifiers. Unresolvable characters fail loudly.
-        if (h_ == INVALID_HANDLE_VALUE) return false;
+        //
+        // Cancellation is polled between characters only - never between the
+        // down and up legs of one stroke - so an interrupted run cannot leave a
+        // usage pressed. Every early return clears a Shift this run engaged.
+        if (h_ == INVALID_HANDLE_VALUE) return TextOutcome::Failed;
+        bool shiftHeld = false;
+        // Returns false when a Shift this run engaged could NOT be cleared on the
+        // device. Best-effort is not enough here: silently reporting "cancelled"
+        // while the device still holds Shift would leave the keyboard in exactly
+        // the state an emergency stop exists to prevent, so the caller is told.
+        auto clearModifiers = [&]() -> bool {
+            if (!shiftHeld) return true;
+            shiftHeld = false;
+            return submit(0, 0, TextDeckKeyActionModifiers, 0); // clear the held set
+        };
         for (char c : text) {
+            if (cancelled && cancelled()) {
+                // A cancelled run that cannot unwind its modifiers is a failure,
+                // not a clean stop: report the outcome that actually happened.
+                return clearModifiers() ? TextOutcome::Cancelled : TextOutcome::Failed;
+            }
             std::string keyName; bool shift = false;
-            if (!CharToStroke(c, keyName, shift)) return false;
+            if (!CharToStroke(c, keyName, shift)) {
+                clearModifiers();
+                return TextOutcome::Failed;
+            }
             const KeyInfo* ki = FindKey(keyName);
-            if (!ki || ki->isModifier) return false;
-            const UCHAR mods = shift ? (UCHAR)0x02 : (UCHAR)0; // TEXTDECK_MOD_LEFT_SHIFT
-            if (shift && !submit(0, 0, TextDeckKeyActionModifiers, mods)) return false;
-            if (!submit(ki->hidUsage, 0, TextDeckKeyActionDown, mods)) return false;
-            if (!submit(ki->hidUsage, 0, TextDeckKeyActionUp, (UCHAR)0)) return false;
+            if (!ki || ki->isModifier) {
+                clearModifiers();
+                return TextOutcome::Failed;
+            }
+            const UCHAR mods = shift ? (UCHAR)TEXTDECK_MOD_LEFT_SHIFT : (UCHAR)0;
+            if (shift) {
+                if (!submit(0, 0, TextDeckKeyActionModifiers, mods)) return TextOutcome::Failed;
+                shiftHeld = true;
+            }
+            if (!submit(ki->hidUsage, 0, TextDeckKeyActionDown, mods)) {
+                clearModifiers();
+                return TextOutcome::Failed;
+            }
+            if (!submit(ki->hidUsage, 0, TextDeckKeyActionUp, (UCHAR)0)) {
+                // The usage may still be down on the device: one explicit retry
+                // with the all-zero modifier set before reporting the failure.
+                submit(ki->hidUsage, 0, TextDeckKeyActionUp, (UCHAR)0);
+                shiftHeld = false; // the retry/Up carries Modifiers=0
+                return TextOutcome::Failed;
+            }
             // the Up above already produced the all-zero report when mods==0;
             // when shift was held, one more Modifiers(0) is sent by Up's 0 mods.
+            shiftHeld = false;
         }
-        return true;
+        return TextOutcome::Ok;
     }
     bool releaseAll() override {
         if (h_ == INVALID_HANDLE_VALUE) return false;

@@ -20,6 +20,7 @@
 #include <atomic>
 #include <functional>
 #include <memory>
+#include <mutex>
 #include <string>
 #include <thread>
 #include <unordered_map>
@@ -164,25 +165,132 @@ public:
     void dispatch(const Event& e);
     void tick(uint64_t nowMs);   // drives HoldRepeat / LongPress while held
 
-    void cancelSource(const std::string& source); // device disconnect
-    void cancelAll();                             // emergency stop
-    void requestCancel();                         // async: interrupt a running script
+    void cancelSource(const std::string& source, uint64_t requestEpoch = 0); // device disconnect
+    void cancelAll(uint64_t requestEpoch = 0);                              // emergency stop
+    // Split forms, for callers that must order cleanup before making the stop
+    // externally visible. releaseAllKeys() releases every key and clears trigger
+    // latches but acknowledges nothing; acknowledgeStop(epoch) then publishes
+    // completion. The executor uses this so the FIFO barrier sits between them.
+    void releaseAllKeys();
+    void acknowledgeStop(uint64_t epoch);
+    // Async, any thread. requestCancel() interrupts a running script (used by a
+    // single device disconnect); requestStop() also forbids any NEW action from
+    // starting (emergency stop). Both return the epoch that identifies the
+    // request, so the executor can acknowledge exactly it and not a later one.
+    uint64_t requestCancel();
+    uint64_t requestStop();
+    // Test-only observation hook, empty in production. Invoked from requestStop()
+    // while it holds cancelTrackMu_, i.e. at the exact point where the epoch has
+    // been allocated and its Stop scope registered but NOT yet published. A test
+    // uses it to run a concurrent source cleanup inside that window and prove it
+    // cannot acknowledge the Stop. It must not call back into the engine.
+    void setStopPublicationHook(std::function<void(uint64_t)> fn) { stopPublishHook_ = std::move(fn); }
+    // Test-only, empty in production. Invoked at the very TOP of cancelSource(),
+    // BEFORE it takes cancelTrackMu_. It lets a test prove that a competing cleanup
+    // has actually entered the cleanup path while the Stop publisher still holds
+    // the lock - i.e. distinguish "not yet scheduled" from "blocked on the lock".
+    // The callback runs WITHOUT cancelTrackMu_ held and must not call back into the
+    // engine; it exists only to signal the test thread.
+    void setSourceCleanupPrelockHook(std::function<void(const std::string&)> fn) {
+        prelockHook_ = std::move(fn);
+    }
+    // Test-only, empty in production. When set, cancelSource() probes the snapshot
+    // lock with try_lock() BEFORE taking it and reports whether the acquisition
+    // succeeded, so a test can prove the competing cleanup actually attempted the
+    // mutex and found it unavailable (real contention) rather than merely not
+    // having been scheduled. The report runs WITHOUT cancelTrackMu_ held when the
+    // probe fails, so it must not call back into the engine.
+    //
+    // Production path: with no probe installed, the snapshot still takes the lock
+    // directly via lock_guard - no try_lock, no extra atomic, identical linearization
+    // point.
+    void setSnapshotLockProbe(std::function<void(bool acquired)> fn) {
+        snapshotProbe_ = std::move(fn);
+    }
+    // True while an accepted request has not been acknowledged yet. Producers may
+    // poll these (read-only); only cancelAll()/cancelSource() acknowledge.
+    bool cancelPending() const;
+    bool stopPending() const;
+    // True once THIS request has been fully handled, so a queued control item
+    // whose stop already ran is not replayed (no double stop).
+    //
+    // Requests are tracked, not merely counted: a single "highest acknowledged
+    // epoch" watermark cannot answer this. A newer request (a per-source cancel,
+    // epoch 11) can be acknowledged while an older stop (epoch 10) is still
+    // unhandled, and a watermark would then claim 10 was handled too, unblocking
+    // dispatch while the global emergency release had never run. A request
+    // acknowledged out of order therefore stays unhandled until its own cleanup.
+    bool cancelAcknowledged(uint64_t epoch) const;
+    // Newest stop epoch. Producers stamp queued events with it, so the executor
+    // can tell an event that predates a stop from one posted after it instead of
+    // guessing from arrival order. Returns 0 when no stop is outstanding, so a
+    // completed stop never stamps (and so never discards) later input.
+    uint64_t pendingStopEpoch() const;
     void updateClock(uint64_t nowMs);
     void setRealtime(bool r) { realtime_ = r; }
 
     std::vector<std::string> heldKeys() const;
+    // Keys whose physical KeyUp the backend refused. They stay tracked (see
+    // KeyOwnership::unresolvedKeys) so an emergency sweep can report and retry
+    // them instead of silently forgetting a key that may still be down.
+    std::vector<std::string> unresolvedKeyReleases() const;
+    size_t unresolvedReleaseCount() const { return ownership_.unresolvedCount(); }
+    // Retry unresolved physical releases once; returns how many were resolved.
+    size_t retryUnresolvedReleases();
     // Output transitions the backend refused (unknown key / device missing).
     // Observable so callers never mistake a failed send for a successful one.
     size_t outputFailures() const;
+    // Text injections the backend refused to complete for a reason other than
+    // cancellation. Kept apart from a cancelled run, which is an expected stop
+    // and not an error.
+    size_t textFailures() const { return textFailures_; }
     size_t bindingCount() const { return activeBindings_().size(); }
     double lastValue(const std::string& source, const std::string& control) const;
 
 private:
     struct CancelState { bool cancelled = false; };
 
+    // ---- cancellation state machine ---------------------------------------
+    // Two independent things must be interruptible, and conflating them lost
+    // key releases:
+    //
+    //   cancel  - "abort the script that is running". Interrupts sleeps, text
+    //             injection and nested blocks. A device disconnect raises this,
+    //             because only a running script's keys need dropping.
+    //   stop    - "no new action may begin". The emergency stop raises this.
+    //
+    // Both are versions of one monotonic request counter (epoch). A request is
+    // acknowledged when the executor has done its cleanup for that epoch:
+    // cancelAll() for a stop, cancelSource()/cancelAll() for a cancel. Dispatch
+    // and every action gate read the epoch, never a flag the dispatcher can
+    // clear, so a request arriving during dispatch initialization is honoured.
+    void acknowledgeCancel(uint64_t epoch);
+    // Acknowledge every request up to and including `epoch`. Only a GLOBAL
+    // cleanup (cancelAll: release every key, clear every trigger) may do this,
+    // because its work is a superset of what those requests needed. A scoped
+    // cancelSource must use acknowledgeSourceCleanup() instead.
+    void acknowledgeCancelThrough(uint64_t epoch);
+    // Acknowledge the requests a SOURCE-SCOPED cleanup actually covers: every
+    // ordinary cancellation at or below `coveredEpoch`, but NEVER a global Stop,
+    // even when the caller reached this path through the default-argument form.
+    // A source cleanup releases only that source's keys, so it cannot satisfy a
+    // request that demands a global release.
+    void acknowledgeSourceCleanup(uint64_t coveredEpoch);
+    // True when this epoch was published by requestStop() (global scope).
+    // Caller must hold cancelTrackMu_.
+    bool isStopLocked(uint64_t epoch) const;
+    // True when this epoch is covered by the in-order watermark or was recorded
+    // out of order. Caller must hold cancelTrackMu_.
+    bool ackCoveredLocked(uint64_t epoch) const;
+    // Advance the in-order watermark over every contiguously acknowledged request.
+    // Caller must hold cancelTrackMu_.
+    void foldAckedLocked();
+    bool runBlock(const std::vector<Action>& block, const std::string& holder, CancelState& cs);
+
     void handle(const Binding& b, const Event& e);
     void runScript(const std::vector<Action>& script, const std::string& holder, CancelState& cs);
     void runAction(const Action& a, const std::string& holder, CancelState& cs);
+    void releaseCancelKeys(const std::string& holder, CancelState& cs);
     bool evalCond(const std::string& cond);
     void sleepMs(int ms);
     bool match(const Binding& b, const Event& e) const;
@@ -205,7 +313,47 @@ private:
     uint64_t now_ = 0;
     uint64_t scriptInstance_ = 0;
     bool realtime_ = false;
-    std::atomic<bool> cancelRequested_{false}; // set async; aborts long scripts
+    // Async cancellation handshake. See the state-machine note above.
+    //   nextEpoch_    the last epoch HANDED OUT (guarded by cancelTrackMu_)
+    //   cancelEpoch_  the newest epoch PUBLISHED as accepted. Publishing may lag
+    //                 allocation by one request: requestStop() takes an epoch under
+    //                 the lock, registers its Stop scope, and only then publishes.
+    //                 Readers therefore never observe an epoch whose scope is not
+    //                 yet recorded.
+    //   cancelAcked_  every request up to here has been handled, in order. Requests
+    //                 handled out of order are NOT folded into it (see
+    //                 ackOutOfOrder_) because doing so would also "acknowledge"
+    //                 older requests that were never cleaned up.
+    //   stopEpoch_    the newest request that also forbids new actions
+    std::atomic<uint64_t> cancelEpoch_{0};
+    std::atomic<uint64_t> cancelAcked_{0};
+    std::atomic<uint64_t> stopEpoch_{0};
+    // Guards the composite state transitions (epoch allocation, scope
+    // registration, Stop publication, acknowledgement). Being atomic is not enough
+    // for those: "allocate + register + publish" and "snapshot + classify" must each
+    // be indivisible with respect to the other.
+    mutable std::mutex cancelTrackMu_;
+    uint64_t nextEpoch_ = 0;             // guarded by cancelTrackMu_
+    // Epochs of requests cleaned up while an older request was still unhandled.
+    // Consulted by cancelAcknowledged()/stopPending(); superseded by cancelAcked_
+    // once the in-order watermark catches up. Guarded by cancelTrackMu_.
+    std::vector<uint64_t> ackOutOfOrder_;
+    // Epochs published by requestStop(). A source-scoped cleanup must never
+    // acknowledge one of these: releasing a single source's keys is not the global
+    // release a Stop demands. Kept as a sorted set because several stops can be
+    // outstanding at once and producers may publish concurrently. Guarded by
+    // cancelTrackMu_; entries at or below cancelAcked_ are pruned.
+    std::vector<uint64_t> stopRequests_;
+    // Kept for diagnostics; never the decision variable (that is the epoch logic).
+    std::atomic<bool> cancelRequested_{false};
+    // Test-only observation hook for the publication window. Never set in
+    // production, so it does not affect the production path's semantics.
+    std::function<void(uint64_t)> stopPublishHook_;
+    // Test-only pre-lock observer for cancelSource(). Empty in production.
+    std::function<void(const std::string&)> prelockHook_;
+    // Test-only contention probe for the snapshot lock. Empty in production.
+    std::function<void(bool acquired)> snapshotProbe_;
+    size_t textFailures_ = 0;   // executor-thread only, like the rest of the state
 
     static std::string ctrlKey(const std::string& s, const std::string& c) { return s + "|" + c; }
 };

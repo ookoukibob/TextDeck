@@ -89,6 +89,8 @@ Invoke-Step $cl ($common + $engineSources + @((Join-Path $tests 'map_v1_selftest
     '/Fe:map_v1_selftest.exe','/Fd:map_v1_selftest.pdb','/link','/SUBSYSTEM:CONSOLE','ws2_32.lib','user32.lib')) | Out-Null
 Invoke-Step $cl ($common + $engineSources + @((Join-Path $tests 'map_audit_test.cpp'),
     '/Fe:map_audit_test.exe','/Fd:map_audit_test.pdb','/link','/SUBSYSTEM:CONSOLE','ws2_32.lib','user32.lib')) | Out-Null
+Invoke-Step $cl ($common + $engineSources + @((Join-Path $tests 'map_cancel_test.cpp'),
+    '/Fe:map_cancel_test.exe','/Fd:map_cancel_test.pdb','/link','/SUBSYSTEM:CONSOLE','ws2_32.lib','user32.lib')) | Out-Null
 Invoke-Step $cl ($common + $engineSources + @((Join-Path $root 'map_hid_e2e_main.cpp'),
     '/Fe:map_hid_e2e.exe','/Fd:map_hid_e2e.pdb','/link','/SUBSYSTEM:CONSOLE','ws2_32.lib','user32.lib','gdi32.lib')) | Out-Null
 Invoke-Step $cl ($common + $engineSources + @((Join-Path $root 'map_link_e2e_main.cpp'),
@@ -96,4 +98,4 @@ Invoke-Step $cl ($common + $engineSources + @((Join-Path $root 'map_link_e2e_mai
 Invoke-Step $cl ($common + $engineSources + @((Join-Path $root 'map_app_main.cpp'),
     '/Fe:map_app.exe','/Fd:map_app.pdb','/link','/SUBSYSTEM:CONSOLE','ws2_32.lib','user32.lib')) | Out-Null
 
-Write-Host "BUILD OK: selftest, mvp, raw_input_test, v1_selftest, audit_test, hid_e2e, link_e2e, map_app"
+Write-Host "BUILD OK: selftest, mvp, raw_input_test, v1_selftest, audit_test, cancel_test, hid_e2e, link_e2e, map_app"
