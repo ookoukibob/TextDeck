@@ -1583,11 +1583,16 @@ int main() {
             hookRan.store(true);
             publishedEpoch.store(epochBeingPublished);
 
-            rival = std::thread([&] {
+            // Capture the epoch BY VALUE: it is the hook's stack parameter and the
+            // hook returns (releasing cancelTrackMu_) while the rival may still be
+            // blocked. Capturing it by reference left the rival reading a dead
+            // stack slot once the hook returned.
+            const uint64_t rivalEpoch = epochBeingPublished;
+            rival = std::thread([&, rivalEpoch] {
                 rivalStarted.store(true);
                 e.cancelSource("padA");                 // default-argument form
                 stopStillPendingAfterCleanup.store(e.stopPending());
-                stopAckedAfterCleanup.store(e.cancelAcknowledged(epochBeingPublished));
+                stopAckedAfterCleanup.store(e.cancelAcknowledged(rivalEpoch));
                 rivalFinishedCleanup.store(true);
                 hsCv.notify_all();
             });
@@ -1753,7 +1758,13 @@ int main() {
                 bCv.wait_for(lk, std::chrono::seconds(10),
                              [&] { return batchCleaned >= batchPublished; });
             }
-            publisherDone = true;
+            {
+                // All accesses to publisherDone take bMu, including this write: the
+                // cleanup thread reads it under the same mutex. Writing it unlocked
+                // was a data race.
+                std::lock_guard<std::mutex> lk(bMu);
+                publisherDone = true;
+            }
             bCv.notify_all();
         });
 
